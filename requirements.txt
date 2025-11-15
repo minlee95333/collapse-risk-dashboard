@@ -1,0 +1,8 @@
+streamlit
+pandas
+numpy
+plotly
+python-dateutil
+Pillow
+openpyxl
+xlsxwriter
