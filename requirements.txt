@@ -1,4 +1,5 @@
 streamlit
+streamlit-authenticator
 pandas
 numpy
 plotly
@@ -6,4 +7,3 @@ python-dateutil
 Pillow
 openpyxl
 xlsxwriter
-﻿streamlit-authenticator
