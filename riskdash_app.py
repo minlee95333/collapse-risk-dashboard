@@ -10,7 +10,7 @@ import streamlit as st
 try:
     import streamlit_authenticator as stauth
     from streamlit_authenticator.utilities.exceptions import LoginError
-except ModuleNotFoundError as exc:
+except ModuleNotFoundError as exc:  
     st.error(
         "필요한 라이브러리 `streamlit-authenticator`가 설치되어 있지 않습니다. "
         "`pip install streamlit-authenticator` 명령으로 설치한 뒤 다시 실행하세요."
@@ -26,6 +26,169 @@ except ModuleNotFoundError as exc:
     st.stop()
 import html
 import io
+import re
+
+def _strip_schedule_columns(columns):
+    stripped = []
+    for col in columns:
+        if isinstance(col, str):
+            stripped.append(col.replace("\ufeff", "").strip())
+        else:
+            stripped.append(col)
+    return stripped
+
+
+def _pick_schedule_column(df: pd.DataFrame, *candidates: str) -> str | None:
+    for candidate in candidates:
+        if candidate in df.columns:
+            return candidate
+    return None
+
+
+def load_schedule_from_excel(file) -> pd.DataFrame:
+    """
+    schedule 시트를 가진 엑셀을 읽어 공정표 DataFrame으로 정리한다.
+    """
+    excel_obj = pd.ExcelFile(file)
+    target_sheet = None
+    for sheet_name in excel_obj.sheet_names:
+        if sheet_name.strip().lower() == "schedule":
+            target_sheet = sheet_name
+            break
+    if target_sheet is None:
+        target_sheet = excel_obj.sheet_names[0]
+    
+    # 모든 데이터를 읽기 (header=0으로 첫 행을 헤더로 인식)
+    df_raw = pd.read_excel(file, sheet_name=target_sheet, header=0)
+    
+    # 원본 데이터 정보 출력
+    print(f"[디버그] 엑셀 시트 '{target_sheet}'에서 읽은 원본 행 수: {len(df_raw)}")
+    
+    # 빈 행 정보 확인
+    all_nan_mask = df_raw.isna().all(axis=1)
+    non_empty_rows = (~all_nan_mask).sum()
+    if non_empty_rows < len(df_raw):
+        print(f"[디버그] 데이터가 있는 행: {non_empty_rows}개, 완전히 빈 행: {len(df_raw) - non_empty_rows}개")
+    
+    df_raw.columns = _strip_schedule_columns(df_raw.columns)
+    print(f"[디버그] 컬럼: {list(df_raw.columns)}")
+
+    col_task_id = _pick_schedule_column(df_raw, "task_id", "Task ID", "ID")
+    col_task_name = _pick_schedule_column(df_raw, "task_name", "공정 명", "공정명", "작업명")
+    col_process_type = _pick_schedule_column(
+        df_raw, "process_type", "공정 유형", "공정유형", "task_type", "유형"
+    )
+    col_zone = _pick_schedule_column(df_raw, "zone", "구역", "구역명", "area", "Zone")
+    col_start = _pick_schedule_column(
+        df_raw, "start_date", "계획 시작", "계획시작", "planned_start", "시작일", "Start"
+    )
+    col_end = _pick_schedule_column(
+        df_raw, "end_date", "계획 종료", "계획종료", "planned_end", "종료일", "End"
+    )
+    col_hazard = _pick_schedule_column(
+        df_raw, "hazard_codes", "hazard code", "hazard_code", "위험코드"
+    )
+
+    missing_required = [
+        name
+        for name, col in {
+            "공정 명": col_task_name,
+            "계획 시작": col_start,
+            "계획 종료": col_end,
+        }.items()
+        if col is None
+    ]
+    if missing_required:
+        raise ValueError(f"필수 열을 찾을 수 없습니다: {', '.join(missing_required)}")
+
+    df = df_raw.copy()
+    initial_row_count = len(df)
+    print(f"[디버그] 엑셀에서 읽은 전체 행 수: {initial_row_count}")
+    
+    # 모든 열이 비어있는 행만 제거 (필수 열 기준으로 판단)
+    # dropna(how="all")은 모든 열이 비어야 하므로, 필수 열만 체크하도록 변경
+    df = df.dropna(how="all")
+    after_dropna_count = len(df)
+    if after_dropna_count < initial_row_count:
+        print(f"[디버그] 완전히 빈 행 제거 후: {after_dropna_count}개 (제거됨: {initial_row_count - after_dropna_count}개)")
+    
+    # 혹시 필수 열에만 데이터가 없는 행도 체크
+    if col_task_name in df.columns:
+        before_name_check = len(df)
+        df = df[df[col_task_name].notna() | df[col_start].notna() | df[col_end].notna()]
+        after_name_check = len(df)
+        if after_name_check < before_name_check:
+            print(f"[디버그] 필수 데이터 없는 행 제거 후: {after_name_check}개 (제거됨: {before_name_check - after_name_check}개)")
+
+    df[col_start] = pd.to_datetime(df[col_start], errors="coerce")
+    df[col_end] = pd.to_datetime(df[col_end], errors="coerce")
+    
+    # 날짜가 유효하지 않은 행 필터링
+    valid_dates_mask = df[col_start].notna() & df[col_end].notna()
+    invalid_date_count = (~valid_dates_mask).sum()
+    if invalid_date_count > 0:
+        print(f"⚠️ 경고: 유효하지 않은 날짜를 가진 {invalid_date_count}개의 행이 제외되었습니다.")
+        # 제외된 행의 공정명 출력
+        invalid_rows = df[~valid_dates_mask]
+        for idx, row in invalid_rows.iterrows():
+            task_name = row[col_task_name] if pd.notna(row[col_task_name]) else "(공정명 없음)"
+            start_val = row[col_start]
+            end_val = row[col_end]
+            print(f"  - 행 {idx}: {task_name} (시작: {start_val}, 종료: {end_val})")
+    df = df[valid_dates_mask].copy()
+    
+    # 공정명이 비어있는 행 필터링
+    valid_name_mask = df[col_task_name].notna() & (df[col_task_name].astype(str).str.strip() != "")
+    invalid_name_count = (~valid_name_mask).sum()
+    if invalid_name_count > 0:
+        print(f"⚠️ 경고: 공정명이 비어있는 {invalid_name_count}개의 행이 제외되었습니다.")
+        # 제외된 행의 날짜 정보 출력
+        invalid_rows = df[~valid_name_mask]
+        for idx, row in invalid_rows.iterrows():
+            start_val = row[col_start]
+            end_val = row[col_end]
+            print(f"  - 행 {idx}: (공정명 비어있음) {start_val} ~ {end_val}")
+    df = df[valid_name_mask].copy()
+    
+    print(f"[디버그] 최종 로드된 공정 수: {len(df)}개")
+
+    rename_map: dict[str, str] = {
+        col_task_name: "task_name",
+        col_start: "start_date",
+        col_end: "end_date",
+    }
+    if col_task_id:
+        rename_map[col_task_id] = "task_id"
+    if col_process_type:
+        rename_map[col_process_type] = "process_type"
+    if col_zone:
+        rename_map[col_zone] = "zone"
+    if col_hazard:
+        rename_map[col_hazard] = "hazard_codes"
+
+    df = df.rename(columns=rename_map)
+
+    if "process_type" not in df.columns:
+        df["process_type"] = ""
+
+    df["duration_days"] = (df["end_date"] - df["start_date"]).dt.days + 1
+
+    if "hazard_codes" in df.columns:
+        df["hazard_codes"] = (
+            df["hazard_codes"]
+            .fillna("")
+            .astype(str)
+            .str.replace(" ", "", regex=False)
+            .str.split(",")
+        )
+        df["hazard_codes"] = df["hazard_codes"].apply(lambda lst: [code for code in lst if code])
+    else:
+        df["hazard_codes"] = [[] for _ in range(len(df))]
+
+    df["task_type"] = df["process_type"]
+
+    return df
+
 
 # ==========================
 # 0) 논문 기반 상수 (프로토타입)
@@ -85,6 +248,51 @@ AMI_COMBOS = {
 DEFAULT_THRESH_R1 = 0.149   # H/F/E 관련 임계
 DEFAULT_THRESH_R2 = 0.236   # M 관련 임계
 CATASTROPHIC_MARGIN = 1.10  # Catastrophic 등급 판정 시 R1 임계 초과 배수
+
+# ==========================
+# 기본 위험요소 매핑 (공정 유형 → 위험 코드)
+# ==========================
+# 사용자가 매핑 파일을 업로드하지 않았을 때 사용되는 기본 매핑
+DEFAULT_HAZARD_MAPPING = {
+    # 토목/굴착 관련
+    "터파기": "120202, 210103",
+    "굴착": "120202, 210103",
+    "기초 굴착": "120202, 210103, 43",
+    "흙막이": "120202, 210103, 43",
+    
+    # 가설 구조물
+    "가설 공사": "120202, 210202",
+    "비계 공사": "120202, 43",
+    "동파이프 비계": "120202, 210202, 43",
+    
+    # 철근/거푸집
+    "철근 배근": "120202, 120203, 43",
+    "철근 공사": "120202, 120203, 43",
+    "거푸집 설치": "120202, 210202",
+    "거푸집 공사": "120202, 210202",
+    
+    # 콘크리트
+    "콘크리트 타설": "120201, 120202, 210103, 43",
+    "콘크리트 공사": "120201, 120202, 210103, 43",
+    "콘크리트 양생": "120202, 210103, 120203, 43",
+    "양생 및 해체": "120202, 210103, 120203, 43",
+    "양생및해체": "120202, 210103, 120203, 43",
+    
+    # 조적/마감
+    "조적공사": "120202, 120203, 43",
+    "벽돌 쌓기": "120202, 120203, 43",
+    "미장 공사": "120202, 120203",
+    
+    # 설비
+    "전기 공사": "210301, 210201, 210202",
+    "배관 공사": "120202, 210201",
+    "기계설비": "120201, 210202, 43",
+    
+    # 기타
+    "철거": "120202, 210103, 43",
+    "해체": "120202, 210103, 120203, 43",
+    "안전시설": "120203, 43",
+}
 
 MITIGATION_ACTION_CATEGORIES = [
     {
@@ -700,6 +908,174 @@ def get_action_params(category_key, detail_key):
 
 DEFAULT_SITE_NAME = "프로젝트 A 현장"
 DEFAULT_SITE_LOCATION = "서울특별시 중구 을지로 100"
+
+SCHEDULE_COLUMNS = [
+    "task_id",
+    "task_name",
+    "task_type",
+    "zone",
+    "planned_start",
+    "planned_end",
+    "crew_count",
+]
+
+SCHEDULE_OPTIONAL_COLUMNS = [
+    "actual_start",
+    "actual_end",
+    "hazard_codes",
+]
+
+SCHEDULE_COLUMN_SYNONYMS = {
+    "task_id": [
+        "task_id",
+        "taskid",
+        "id",
+        "공정id",
+        "공정_id",
+        "공정 id",
+    ],
+    "task_name": [
+        "task_name",
+        "taskname",
+        "name",
+        "공정",
+        "공정명",
+        "작업명",
+        "task",
+    ],
+    "task_type": [
+        "task_type",
+        "tasktype",
+        "type",
+        "process_type",
+        "공정유형",
+        "공정 유형",
+        "유형",
+    ],
+    "zone": [
+        "zone",
+        "area",
+        "구역",
+        "zone_name",
+        "location",
+        "위치",
+    ],
+    "planned_start": [
+        "planned_start",
+        "plannedstart",
+        "start",
+        "start_date",
+        "startdate",
+        "계획시작",
+        "계획 시작",
+        "시작일",
+        "start day",
+    ],
+    "planned_end": [
+        "planned_end",
+        "plannedend",
+        "end",
+        "end_date",
+        "enddate",
+        "계획종료",
+        "계획 종료",
+        "종료일",
+        "finish",
+    ],
+    "crew_count": [
+        "crew_count",
+        "crew",
+        "인원",
+        "투입인원",
+        "인원수",
+        "투입 인원",
+        "crew size",
+    ],
+    "actual_start": [
+        "actual_start",
+        "actualstart",
+        "실제시작",
+        "실제 시작",
+        "real_start",
+        "actual start",
+    ],
+    "actual_end": [
+        "actual_end",
+        "actualend",
+        "실제종료",
+        "실제 종료",
+        "완료일",
+        "finish_date",
+        "actual finish",
+    ],
+    "hazard_codes": [
+        "hazard_codes",
+        "hazardcode",
+        "hazards",
+        "hazard list",
+        "위험코드",
+        "위험 코드",
+        "risk_codes",
+    ],
+}
+
+
+def _normalize_schedule_alias_key(name: str) -> str:
+    """
+    공정표 엑셀 열 이름을 비교하기 위해 공백/특수문자를 제거한 키를 만든다.
+    """
+    if name is None:
+        return ""
+    normalized = re.sub(r"[\\s_\\-]+", "", str(name).strip().lower())
+    return normalized
+
+
+SCHEDULE_COLUMN_ALIAS: dict[str, str] = {}
+for canonical, aliases in SCHEDULE_COLUMN_SYNONYMS.items():
+    for alias in aliases:
+        alias_key = _normalize_schedule_alias_key(alias)
+        if alias_key and alias_key not in SCHEDULE_COLUMN_ALIAS:
+            SCHEDULE_COLUMN_ALIAS[alias_key] = canonical
+
+TASK_TYPE_OPTIONS = {
+    "1. 토목": [
+        "터파기",
+        "흙막이/가설",
+        "기초 굴착",
+        "되메우기",
+    ],
+    "2. 건축": [
+        "가설 공사",
+        "비계 공사",
+        "철근 배근",
+        "거푸집 설치",
+        "콘크리트 타설",
+        "양생 및 해체",
+        "조적공사",
+        "미장공사",
+        "방수공사",
+        "타일공사",
+        "도장공사",
+        "수장공사",
+    ],
+    "3. 기계": [
+        "배관설비",
+        "위생설비",
+        "냉난방설비",
+        "공조설비",
+    ],
+    "4. 전기": [
+        "전력설비",
+        "조명설비",
+        "전열설비",
+        "통신설비",
+    ],
+    "5. 소방": [
+        "소화설비",
+        "경보설비",
+        "피난설비",
+    ],
+}
 
 if "site_name" not in st.session_state:
     st.session_state["site_name"] = DEFAULT_SITE_NAME
@@ -1477,6 +1853,504 @@ st.markdown(
         margin: 0 0 6px 0;
         font-size: 0.98rem;
       }
+      .summary-wrapper {
+        background: #ffffff;
+        border-radius: 26px;
+        padding: 28px 30px;
+        box-shadow: 0 22px 48px rgba(15, 23, 42, 0.10);
+        display: flex;
+        flex-direction: column;
+        gap: 24px;
+        margin-bottom: 28px;
+      }
+      .summary-attention {
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+      }
+      .summary-attention-title {
+        font-size: 1.05rem;
+        font-weight: 600;
+        color: #1f2937;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+      .summary-card-grid {
+        display: flex;
+        flex-direction: column;
+        gap: 24px;
+      }
+      .summary-card {
+        background: #ffffff;
+        border-radius: 22px;
+        border: 1px solid #e2e8f0;
+        box-shadow: 0 16px 36px rgba(15, 23, 42, 0.08);
+        padding: 24px 26px;
+      }
+      .summary-card-risk {
+        background: linear-gradient(180deg, rgba(59,130,246,0.06) 0%, #ffffff 55%);
+      }
+      .summary-lower-card {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 22px;
+        align-items: stretch;
+        padding: 18px 22px;
+      }
+      .summary-lower-left,
+      .summary-lower-right {
+        flex: 1 1 320px;
+        display: flex;
+        flex-direction: column;
+        gap: 14px;
+      }
+      .summary-card-process {
+        padding: 16px 18px;
+        display: flex;
+        align-items: center;
+      }
+      .hero-card-header {
+        padding-bottom: 14px;
+      }
+      .summary-title-line {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        font-size: 1rem;
+        font-weight: 700;
+        color: #1f2937;
+      }
+      .summary-status-dot {
+        width: 18px;
+        height: 18px;
+        border-radius: 999px;
+        background: rgba(248, 113, 113, 0.2);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        position: relative;
+      }
+      .summary-status-dot::after {
+        content: "";
+        width: 8px;
+        height: 8px;
+        border-radius: 999px;
+        background: #ef4444;
+        position: absolute;
+        animation: summaryPulse 1.8s ease-in-out infinite;
+      }
+      @keyframes summaryPulse {
+        0%, 100% { transform: scale(1); opacity: 0.8; }
+        50% { transform: scale(1.4); opacity: 0.35; }
+      }
+      .summary-risk-display {
+        margin-top: 22px;
+        margin-bottom: 22px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+      .summary-risk-pill {
+        display: inline-flex;
+        align-items: center;
+        gap: 12px;
+        padding: 18px 26px;
+        border-radius: 18px;
+        background: linear-gradient(135deg, #2563eb 0%, #1e40af 100%);
+        color: #fff;
+        font-size: clamp(1.4rem, 3vw, 2.4rem);
+        font-weight: 700;
+        box-shadow: 0 18px 42px rgba(37, 99, 235, 0.35);
+      }
+      .summary-risk-pill.level-red {
+        background: linear-gradient(135deg, #ef4444 0%, #b91c1c 100%);
+        box-shadow: 0 18px 42px rgba(239, 68, 68, 0.35);
+      }
+      .summary-risk-pill.level-yellow {
+        background: linear-gradient(135deg, #f59e0b 0%, #d97706 100%);
+        box-shadow: 0 18px 42px rgba(245, 158, 11, 0.35);
+      }
+      .summary-risk-pill.muted {
+        background: linear-gradient(135deg, #cbd5f5 0%, #94a3b8 100%);
+        color: #1f2937;
+        box-shadow: none;
+      }
+      .summary-risk-pill span.icon {
+        display: inline-flex;
+        width: 34px;
+        height: 34px;
+        border-radius: 999px;
+        background: rgba(255,255,255,0.18);
+        align-items: center;
+        justify-content: center;
+      }
+      .summary-risk-metrics {
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+      }
+      .summary-risk-empty {
+        margin-top: 18px;
+        font-size: 0.98rem;
+        color: #94a3b8;
+        text-align: left;
+      }
+      .summary-risk-content {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 28px;
+        align-items: center;
+        justify-content: space-between;
+      }
+      .summary-risk-left {
+        flex: 1 1 260px;
+        display: flex;
+        justify-content: center;
+      }
+      .summary-risk-right {
+        flex: 1 1 220px;
+        min-width: 200px;
+        display: flex;
+        flex-direction: column;
+        gap: 14px;
+      }
+      .summary-risk-metric-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 12px 16px;
+        border-radius: 14px;
+        background: rgba(226, 232, 240, 0.45);
+        border: 1px solid rgba(148, 163, 184, 0.18);
+      }
+      .summary-risk-metric-label {
+        font-size: 0.92rem;
+        font-weight: 600;
+        color: #475569;
+      }
+      .summary-risk-metric-value {
+        font-size: 1.4rem;
+        font-weight: 700;
+        color: #0f172a;
+      }
+      .summary-process-card {
+        display: flex;
+        gap: 14px;
+        align-items: center;
+      }
+      .summary-process-header-icon {
+        display: inline-flex;
+        width: 22px;
+        height: 22px;
+        align-items: center;
+        justify-content: center;
+        font-size: 1.1rem;
+      }
+      .summary-process-icon {
+        width: 52px;
+        height: 52px;
+        border-radius: 16px;
+        background: rgba(251, 191, 36, 0.18);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 1.6rem;
+      }
+      .summary-process-text {
+        font-size: 1.4rem;
+        font-weight: 700;
+        color: #1f2937;
+      }
+      .summary-process-sub {
+        margin-top: 6px;
+        font-size: 0.95rem;
+        color: #64748b;
+      }
+      .summary-process-list {
+        margin: 12px 0 0;
+        padding-left: 20px;
+        color: #1f2937;
+        font-size: 1.05rem;
+        font-weight: 600;
+      }
+      .summary-process-list li {
+        margin-bottom: 6px;
+      }
+      .summary-process-empty {
+        margin-top: 10px;
+        font-size: 0.95rem;
+        color: #94a3b8;
+      }
+      .summary-metrics-card {
+        background: #ffffff;
+        border-radius: 22px;
+        border: 1px solid #e2e8f0;
+        box-shadow: 0 16px 36px rgba(15, 23, 42, 0.08);
+        overflow: hidden;
+        display: flex;
+        flex-direction: column;
+      }
+      .summary-metrics-header {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 18px 22px;
+        background: rgba(226, 232, 240, 0.45);
+        border-bottom: 1px solid rgba(148, 163, 184, 0.22);
+        font-size: 0.92rem;
+        font-weight: 700;
+        color: #1f2937;
+      }
+      .summary-metrics-header span.icon {
+        display: inline-flex;
+        width: 22px;
+        height: 22px;
+        align-items: center;
+        justify-content: center;
+        border-radius: 999px;
+        background: rgba(37, 99, 235, 0.12);
+        color: #2563eb;
+      }
+      .summary-metrics-body {
+        display: flex;
+        flex-direction: column;
+      }
+      .summary-metrics-row {
+        display: flex;
+        border-bottom: 1px solid rgba(148, 163, 184, 0.18);
+      }
+      .summary-metrics-row:last-child {
+        border-bottom: none;
+      }
+      .summary-metrics-label {
+        flex: 0 0 34%;
+        background: rgba(226, 232, 240, 0.35);
+        padding: 20px 22px;
+        font-size: 0.95rem;
+        font-weight: 600;
+        color: #475569;
+        display: flex;
+        align-items: center;
+      }
+      .summary-metrics-value {
+        flex: 1;
+        padding: 20px 24px;
+        display: flex;
+        align-items: center;
+        justify-content: flex-end;
+        font-size: 1.8rem;
+        font-weight: 700;
+        color: #0f172a;
+      }
+      .summary-metrics-value strong {
+        font-size: 2.2rem;
+        font-weight: 800;
+      }
+      .summary-warning-wrapper {
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+      }
+      .summary-warning-header {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        font-size: 0.95rem;
+        font-weight: 700;
+        color: #f97316;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+      }
+      .summary-warning-card {
+        position: relative;
+        border-radius: 20px;
+        padding: 20px 22px;
+        background: linear-gradient(135deg, #dbeafe 0%, #3b82f6 100%);
+        color: #0b1e3c;
+        box-shadow: 0 16px 36px rgba(59, 130, 246, 0.18);
+        overflow: hidden;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        text-align: center;
+        min-height: 100px;
+      }
+      .summary-warning-card.alert {
+        background: linear-gradient(135deg, #fee2e2 0%, #ef4444 100%);
+        color: #7f1d1d;
+        box-shadow: 0 22px 48px rgba(239, 68, 68, 0.25);
+      }
+      .summary-warning-card::after {
+        content: "";
+        position: absolute;
+        bottom: -36px;
+        right: -36px;
+        width: 140px;
+        height: 140px;
+        background: rgba(255, 255, 255, 0.16);
+        border-radius: 999px;
+        filter: blur(0px);
+      }
+      .summary-warning-card .summary-warning-icon {
+        position: absolute;
+        top: 14px;
+        right: 18px;
+        opacity: 0.42;
+        font-size: 1.6rem;
+      }
+      .summary-warning-card p {
+        margin: 0;
+        font-size: 1.05rem;
+        font-weight: 600;
+        line-height: 1.6;
+        position: relative;
+        z-index: 1;
+      }
+      .summary-warning-card .summary-warning-line {
+        margin-bottom: 8px;
+        text-align: center;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        position: relative;
+        z-index: 1;
+      }
+      .summary-warning-card .summary-warning-line:last-child {
+        margin-bottom: 0;
+      }
+      .hero-grid {
+        display: flex;
+        flex-direction: column;
+        gap: 22px;
+      }
+      .hero-card {
+        background: linear-gradient(135deg, #ffffff 0%, #f8fafc 100%);
+        border-radius: 22px;
+        padding: 28px 32px;
+        box-shadow: 0 20px 48px rgba(15, 23, 42, 0.12);
+        border: 2px solid #e2e8f0;
+      }
+      .hero-card-header {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        flex-wrap: wrap;
+      }
+      .summary-hero {
+        display: flex;
+        flex-direction: column;
+        gap: 20px;
+      }
+      .hero-card-section {
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+      }
+      .hero-card-divider {
+        height: 1px;
+        background: linear-gradient(90deg, rgba(148, 163, 184, 0.12), rgba(148, 163, 184, 0));
+        margin: 0 6px;
+      }
+      .hero-card-title {
+        font-size: 0.92rem;
+        font-weight: 600;
+        color: #64748b;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+        margin-bottom: 14px;
+      }
+      .hero-card-content {
+        font-size: 1.4rem;
+        font-weight: 600;
+        color: #0f172a;
+        line-height: 1.6;
+      }
+      .hero-card-content-small {
+        font-size: 1.05rem;
+        color: #475569;
+        line-height: 1.8;
+        margin-top: 8px;
+      }
+      .hero-card-subtitle {
+        font-size: 0.95rem;
+        font-weight: 600;
+        color: #64748b;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+      .hero-card-metric-badge {
+        display: inline-flex;
+        align-items: center;
+        padding: 6px 14px;
+        border-radius: 999px;
+        background: rgba(29, 78, 216, 0.12);
+        color: #1d4ed8;
+        font-size: 0.9rem;
+        font-weight: 600;
+        letter-spacing: 0.01em;
+      }
+      .hero-card-metric-badge.badge-muted {
+        background: rgba(148, 163, 184, 0.15);
+        color: #64748b;
+      }
+      .risk-level-badge {
+        display: inline-block;
+        padding: 12px 24px;
+        border-radius: 14px;
+        font-size: 1.55rem;
+        font-weight: 700;
+        box-shadow: 0 10px 24px rgba(0, 0, 0, 0.15);
+      }
+      .risk-level-red {
+        background: linear-gradient(135deg, #dc2626 0%, #b91c1c 100%);
+        color: #fff;
+      }
+      .risk-level-yellow {
+        background: linear-gradient(135deg, #f59e0b 0%, #d97706 100%);
+        color: #fff;
+      }
+      .risk-level-blue {
+        background: linear-gradient(135deg, #3b82f6 0%, #1d4ed8 100%);
+        color: #fff;
+      }
+      .period-stats {
+        background: #f9fafb;
+        border-radius: 16px;
+        padding: 20px 24px;
+        margin-top: 18px;
+        margin-bottom: 28px;
+      }
+      .period-stats-title {
+        font-size: 1.05rem;
+        font-weight: 600;
+        color: #475569;
+        margin-bottom: 16px;
+      }
+      .period-stats-grid {
+        display: flex;
+        gap: 20px;
+        flex-wrap: wrap;
+      }
+      .period-stat-item {
+        flex: 1;
+        min-width: 160px;
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+      }
+      .period-stat-label {
+        font-size: 0.82rem;
+        color: #64748b;
+        font-weight: 500;
+      }
+      .period-stat-value {
+        font-size: 1.2rem;
+        color: #0f172a;
+        font-weight: 600;
+      }
     </style>
     """,
     unsafe_allow_html=True
@@ -1491,22 +2365,36 @@ with col_help:
 site_name_value = st.session_state.get("site_name", DEFAULT_SITE_NAME)
 site_location_value = st.session_state.get("site_location", DEFAULT_SITE_LOCATION)
 current_datetime = dt.datetime.now()
+
+# 현장 정보 카드 표시
 info_placeholder = st.empty()
 info_placeholder.markdown(
     render_top_info(site_name_value, site_location_value, current_datetime, []),
     unsafe_allow_html=True
 )
 
+if "schedule_editor_df" not in st.session_state:
+    st.session_state["schedule_editor_df"] = pd.DataFrame(columns=SCHEDULE_COLUMNS)
+if "schedule_committed_df" not in st.session_state:
+    st.session_state["schedule_committed_df"] = pd.DataFrame(columns=SCHEDULE_COLUMNS)
+if "schedule_committed_at" not in st.session_state:
+    st.session_state["schedule_committed_at"] = None
+if "weather_loaded" not in st.session_state:
+    st.session_state["weather_loaded"] = False
+
 with st.sidebar:
     st.header("데이터 업로드")
     st.text_input("현장 명", key="site_name")
     st.text_input("현장 위치", key="site_location")
-    sch_file = st.file_uploader("공정표 엑셀", type=["xlsx"], help="열 이름: task_id, task_name, zone, planned_start, planned_end, actual_end, hazard_codes")
+    schedule_file = st.file_uploader(
+        "공정표 엑셀",
+        type=["xlsx", "xls", "csv"],
+        help="열 이름 예시: task_id, task_name, task_type, zone, planned_start, planned_end, crew_count, (선택) actual_end, hazard_codes",
+    )
+    schedule_file_message = st.empty()
     wea_file = st.file_uploader("기상 엑셀", type=["xlsx"], help="열 이름: date, address, daily_rain_mm, max_wind_ms, avg_temp_C")
     mapping_file = st.file_uploader("위험요인 매핑 엑셀 (선택)", type=["xlsx"], help="열 이름: task_type, hazard_codes")
-    st.caption("샘플 파일은 본문 상단 설명의 링크에서 내려받으세요.")
-
-    st.markdown("---")
+    st.caption("공정 데이터는 공정표 엑셀 업로드 또는 본문 입력 중 편한 방식을 선택하세요.")
     st.subheader("설정")
     tab_profile, tab_manual, tab_variables = st.tabs(["내 정보", "시스템 설명", "변수 설정"])
 
@@ -1547,7 +2435,7 @@ with st.sidebar:
                 <small>
                 <strong>R1</strong>은 구조, 지반, 하중, 기상 조건 등을 반영한 물리적 붕괴위험 지표입니다.<br>
                 <strong>R2</strong>는 작업 순서, 동시작업, 인력·점검 상태 등을 반영한 관리·운영상 붕괴위험 지표입니다.<br>
-                <strong>R_total</strong>은 R1과 R2를 함께 고려해 산정한 하루 종합 붕괴위험 지표입니다.
+                <strong>종합 위험도</strong>은 R1과 R2를 함께 고려해 산정한 하루 종합 붕괴위험 지표입니다.
                 </small>
                 """,
                 unsafe_allow_html=True,
@@ -1572,8 +2460,6 @@ with st.sidebar:
             rain_thr = st.number_input("일 강수량 ≥ (mm)", min_value=0.0, value=10.0, step=1.0)
             wind_thr = st.number_input("최대 풍속 ≥ (m/s)", min_value=0.0, value=10.0, step=1.0)
 
-st.markdown("---")
-
 # ==========================
 # 2) 함수 (계산 로직)
 # ==========================
@@ -1584,10 +2470,783 @@ def to_date(x):
         return pd.to_datetime(x).date()
     return parse(str(x)).date()
 
-def parse_codes(cell):
-    if pd.isna(cell):
+
+def resolve_schedule_column_name(column_name: str) -> str | None:
+    """
+    엑셀 원본의 열 이름을 표준 공정표 열 이름으로 변환한다.
+    """
+    alias_key = _normalize_schedule_alias_key(column_name)
+    return SCHEDULE_COLUMN_ALIAS.get(alias_key)
+
+
+def normalize_schedule_dataframe_columns(df: pd.DataFrame | None) -> pd.DataFrame | None:
+    """
+    엑셀에서 불러온 공정표 컬럼명을 표준 명칭으로 매핑한다.
+    """
+    if df is None:
+        return None
+    rename_map: dict[str, str] = {}
+    for col in df.columns:
+        canonical = resolve_schedule_column_name(col)
+        if canonical and canonical not in df.columns:
+            rename_map[col] = canonical
+    if rename_map:
+        df = df.rename(columns=rename_map)
+    return df
+
+
+def _dedupe_preserve_order(items):
+    seen = set()
+    ordered = []
+    for item in items:
+        if item not in seen:
+            seen.add(item)
+            ordered.append(item)
+    return ordered
+
+
+def normalize_hazard_code_cell(value) -> list[str]:
+    """
+    위험 코드 셀 값을 ['코드1', '코드2'] 형태로 정규화한다.
+    """
+    if value is None:
         return []
-    return [c.strip() for c in str(cell).split(",") if c.strip()]
+    if isinstance(value, pd.Series):
+        return normalize_hazard_code_cell(value.tolist())
+    if isinstance(value, (list, tuple, set, frozenset)):
+        flattened = []
+        for item in value:
+            flattened.extend(normalize_hazard_code_cell(item))
+        return _dedupe_preserve_order([code for code in flattened if code])
+    if isinstance(value, bytes):
+        try:
+            value = value.decode("utf-8", errors="ignore")
+        except Exception:
+            value = str(value)
+    try:
+        if pd.isna(value):
+            return []
+    except TypeError:
+        pass
+    text = str(value).strip()
+    if not text or text.lower() in {"nan", "none"}:
+        return []
+    if text.startswith("[") and text.endswith("]"):
+        text = text[1:-1]
+    tokens = re.split(r"[,\s;/|]+", text)
+    cleaned = [token.strip() for token in tokens if token and token.strip()]
+    return _dedupe_preserve_order(cleaned)
+
+
+def ensure_hazard_codes_column(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    hazard_codes 컬럼이 항상 리스트 형태를 가지도록 보정한다.
+    """
+    if "hazard_codes" not in df.columns:
+        df["hazard_codes"] = [[] for _ in range(len(df))]
+        return df
+    df["hazard_codes"] = df["hazard_codes"].apply(normalize_hazard_code_cell)
+    return df
+
+def ensure_schedule_dtypes(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    data_editor가 기대하는 dtype으로 변환한다.
+    날짜 컬럼은 Python date 객체, 정수/실수 컬럼은 numeric으로 맞춘다.
+    """
+    if df is None or df.empty:
+        return df
+
+    converted = df.copy()
+    for col in ["planned_start", "planned_end", "actual_start", "actual_end"]:
+        if col in converted.columns:
+            converted[col] = pd.to_datetime(converted[col], errors="coerce")
+            converted[col] = converted[col].dt.date
+
+    if "crew_count" in converted.columns:
+        converted["crew_count"] = pd.to_numeric(converted["crew_count"], errors="coerce").fillna(0).astype(int)
+
+    return converted
+
+
+def prepare_schedule_dataframe(df: pd.DataFrame | None) -> pd.DataFrame:
+    """
+    데이터 에디터에서 입력된 공정 정보를 위험도 계산에 사용할 수 있도록 정규화한다.
+    """
+    if df is None or df.empty:
+        return pd.DataFrame(columns=SCHEDULE_COLUMNS + SCHEDULE_OPTIONAL_COLUMNS)
+
+    df = normalize_schedule_dataframe_columns(df)
+    cleaned = df.copy()
+    cleaned = cleaned.replace({pd.NaT: None})
+
+    cleaned = cleaned.dropna(how="all")
+
+    text_columns = ["task_id", "task_name", "task_type", "zone"]
+    for col in text_columns:
+        if col not in cleaned.columns:
+            cleaned[col] = ""
+        cleaned[col] = cleaned[col].apply(
+            lambda x: str(x).strip() if x not in (None, "", "nan") and not pd.isna(x) else ""
+        )
+
+    date_columns = ["planned_start", "planned_end", "actual_start", "actual_end"]
+    for col in date_columns:
+        if col not in cleaned.columns:
+            cleaned[col] = None
+        cleaned[col] = cleaned[col].apply(lambda x: to_date(x) if x not in (None, "", "NaT") and not pd.isna(x) else None)
+
+    # 필수 날짜 필드가 유효한 행만 유지
+    if "planned_start" in cleaned.columns and "planned_end" in cleaned.columns:
+        valid_dates_mask = cleaned["planned_start"].notna() & cleaned["planned_end"].notna()
+        invalid_date_count = (~valid_dates_mask).sum()
+        if invalid_date_count > 0:
+            print(f"경고: 필수 날짜가 누락된 {invalid_date_count}개의 공정이 제외되었습니다.")
+        cleaned = cleaned[valid_dates_mask].copy()
+    
+    # 공정명이 유효한 행만 유지
+    if "task_name" in cleaned.columns:
+        valid_name_mask = cleaned["task_name"].notna() & (cleaned["task_name"].astype(str).str.strip() != "")
+        invalid_name_count = (~valid_name_mask).sum()
+        if invalid_name_count > 0:
+            print(f"경고: 공정명이 누락된 {invalid_name_count}개의 공정이 제외되었습니다.")
+        cleaned = cleaned[valid_name_mask].copy()
+
+    for col in SCHEDULE_COLUMNS:
+        if col not in cleaned.columns:
+            if col in date_columns:
+                cleaned[col] = None
+            elif col == "crew_count":
+                cleaned[col] = 0
+            else:
+                cleaned[col] = ""
+
+    cleaned["crew_count"] = cleaned["crew_count"].apply(lambda x: int(x) if str(x).strip().isdigit() else 0)
+
+    cleaned = ensure_hazard_codes_column(cleaned)
+
+    if "actual_end" not in cleaned.columns:
+        cleaned["actual_end"] = cleaned["planned_end"]
+    else:
+        cleaned["actual_end"] = cleaned["actual_end"].apply(lambda x: x if x not in (None, "", "NaT") else None)
+        cleaned["actual_end"] = cleaned["actual_end"].fillna(cleaned["planned_end"])
+
+    columns_to_keep = SCHEDULE_COLUMNS + [col for col in SCHEDULE_OPTIONAL_COLUMNS if col in cleaned.columns]
+    cleaned = cleaned[columns_to_keep].reset_index(drop=True)
+    return cleaned
+
+
+def render_schedule_editor_tab():
+    st.session_state.setdefault("schedule_entry_mode", "엑셀 업로드")
+    entry_mode = st.radio(
+        "입력 방식",
+        ["엑셀 업로드", "시스템 입력"],
+        index=0 if st.session_state["schedule_entry_mode"] == "엑셀 업로드" else 1,
+        horizontal=True,
+    )
+    st.session_state["schedule_entry_mode"] = entry_mode
+
+    if entry_mode == "시스템 입력":
+        schedule_editor_df = ensure_schedule_dtypes(st.session_state["schedule_editor_df"])
+        schedule_editor_df = schedule_editor_df.copy()
+
+        # Apply auto-mapping if available (기본 매핑 + 사용자 매핑)
+        mapping_available = False
+        try:
+            # mapping_df는 이미 기본 매핑과 결합된 상태
+            if mapping_df is not None and not mapping_df.empty and "task_type" in mapping_df.columns and "hazard_codes" in mapping_df.columns:
+                mapping_available = True
+        except NameError:
+            # mapping_df가 정의되지 않았다면 기본 매핑만 사용
+            mapping_df = get_effective_mapping_df(None)
+            mapping_available = True
+        
+        if mapping_available:
+            use_auto_map = st.checkbox("공정 유형에 따른 위험코드 자동 매핑", value=True, key="use_auto_map_checkbox")
+            if use_auto_map and "task_type" in schedule_editor_df.columns:
+                # 매핑 딕셔너리 생성
+                mapping_dict = {}
+                for _, row in mapping_df.iterrows():
+                    task_type = str(row["task_type"]).strip()
+                    hazard_codes = str(row["hazard_codes"]).strip() if pd.notna(row["hazard_codes"]) else ""
+                    if task_type and hazard_codes:
+                        mapping_dict[task_type] = hazard_codes
+                
+                if mapping_dict:
+                    def apply_mapping(row):
+                        t_type = str(row.get("task_type", "")).strip()
+                        existing_codes = row.get("hazard_codes", "")
+                        
+                        # 기존 hazard_codes가 비어있으면 매핑 적용
+                        if not existing_codes or str(existing_codes).strip() == "":
+                            return mapping_dict.get(t_type, "")
+                        return existing_codes
+                    
+                    schedule_editor_df["hazard_codes"] = schedule_editor_df.apply(apply_mapping, axis=1)
+                    
+                    # 매핑된 공정 수 표시
+                    mapped_tasks = schedule_editor_df[schedule_editor_df["hazard_codes"].notna() & (schedule_editor_df["hazard_codes"] != "")]["task_type"].unique()
+                    if len(mapped_tasks) > 0:
+                        st.success(f"✅ {len(mapped_tasks)}개 공정 유형에 위험코드가 자동 매핑되었습니다: {', '.join(mapped_tasks)}")
+        else:
+            st.info("ℹ️ 위험요소 매핑 파일을 업로드하면 공정 유형에 따라 위험코드를 자동으로 매핑할 수 있습니다.")
+
+        if "hazard_codes" in schedule_editor_df.columns:
+            schedule_editor_df["hazard_codes"] = schedule_editor_df["hazard_codes"].apply(
+                lambda value: ", ".join(value)
+                if isinstance(value, (list, tuple, set))
+                else ("" if pd.isna(value) else str(value))
+            )
+
+        def _format_editor_dataframe(source_df: pd.DataFrame) -> pd.DataFrame:
+            display_columns = [
+                "task_id",
+                "task_name",
+                "task_type",
+                "zone",
+                "planned_start",
+                "planned_end",
+                "hazard_codes",
+            ]
+            formatted = source_df.reindex(columns=display_columns).copy()
+            if "hazard_codes" in formatted.columns:
+                formatted["hazard_codes"] = formatted["hazard_codes"].fillna("").astype(str)
+            return formatted
+
+        def _restore_hidden_columns(edited_df: pd.DataFrame, base_df: pd.DataFrame) -> pd.DataFrame:
+            display_columns = ["task_id", "task_name", "task_type", "zone", "planned_start", "planned_end", "hazard_codes"]
+            hidden_columns = [col for col in base_df.columns if col not in display_columns]
+            hidden_defaults = {"crew_count": 0, "actual_start": None, "actual_end": None}
+            if hidden_columns:
+                hidden_frame = base_df.reindex(edited_df.index)[hidden_columns]
+            else:
+                hidden_frame = pd.DataFrame(index=edited_df.index)
+            for col in hidden_columns:
+                default_value = hidden_defaults.get(col, None)
+                if col not in hidden_frame:
+                    hidden_frame[col] = default_value
+                else:
+                    if default_value is None:
+                        hidden_frame[col] = hidden_frame[col].where(~hidden_frame[col].isna(), None)
+                    else:
+                        hidden_frame[col] = hidden_frame[col].fillna(default_value)
+            return pd.concat([edited_df, hidden_frame], axis=1)
+
+        category_names = list(TASK_TYPE_OPTIONS.keys())
+        tabs = st.tabs(category_names + ["기타"])
+        updated_segments: list[pd.DataFrame] = []
+
+        for tab, category_name in zip(tabs[:-1], category_names):
+            with tab:
+                category_df = schedule_editor_df[schedule_editor_df["task_name"] == category_name].copy()
+                formatted_df = _format_editor_dataframe(category_df)
+                category_editor_df = st.data_editor(
+                    formatted_df,
+                    num_rows="dynamic",
+                    use_container_width=True,
+                    column_config={
+                        "task_id": st.column_config.TextColumn("공정 ID", help="예: T-01"),
+                        "task_name": st.column_config.TextColumn(
+                            "공정 명",
+                            disabled=True,
+                            help=f"이 탭에서는 '{category_name}' 공정만 편집할 수 있습니다.",
+                            default=category_name,
+                        ),
+                        "task_type": st.column_config.SelectboxColumn(
+                            "공정 유형",
+                            options=TASK_TYPE_OPTIONS.get(category_name, []),
+                            help=f"{category_name} 공정에 해당하는 유형만 선택할 수 있습니다.",
+                        ),
+                        "zone": st.column_config.TextColumn("구역", help="예: B1 존"),
+                        "planned_start": st.column_config.DateColumn("계획 시작", format="YYYY-MM-DD"),
+                        "planned_end": st.column_config.DateColumn("계획 종료", format="YYYY-MM-DD"),
+                        "hazard_codes": st.column_config.TextColumn(
+                            "hazard_codes",
+                            help="쉼표로 구분된 위험 코드 목록을 입력하세요. 예: 120202,210103",
+                        ),
+                    },
+                    key=f"schedule_editor_table_{category_name}",
+                )
+                category_editor_df["task_name"] = category_name
+                updated_segments.append(category_editor_df)
+
+        with tabs[-1]:
+            other_df = schedule_editor_df[~schedule_editor_df["task_name"].isin(category_names)].copy()
+            formatted_df = _format_editor_dataframe(other_df)
+            other_editor_df = st.data_editor(
+                formatted_df,
+                num_rows="dynamic",
+                use_container_width=True,
+                column_config={
+                    "task_id": st.column_config.TextColumn("공정 ID", help="예: T-01"),
+                    "task_name": st.column_config.SelectboxColumn(
+                        "공정 명",
+                        options=category_names,
+                        help="카테고리를 선택하면 해당 탭으로 이동해 편집하는 것이 좋습니다.",
+                    ),
+                    "task_type": st.column_config.TextColumn("공정 유형"),
+                    "zone": st.column_config.TextColumn("구역", help="예: B1 존"),
+                    "planned_start": st.column_config.DateColumn("계획 시작", format="YYYY-MM-DD"),
+                    "planned_end": st.column_config.DateColumn("계획 종료", format="YYYY-MM-DD"),
+                    "hazard_codes": st.column_config.TextColumn(
+                        "hazard_codes",
+                        help="쉼표로 구분된 위험 코드 목록을 입력하세요. 예: 120202,210103",
+                    ),
+                },
+                key="schedule_editor_table_other",
+            )
+            updated_segments.append(other_editor_df)
+
+        merged_display_df = pd.concat(updated_segments, ignore_index=True)
+        merged_display_df = _restore_hidden_columns(merged_display_df, schedule_editor_df)
+        merged_display_df["task_type"] = merged_display_df["task_type"].astype(str)
+        
+        # 에디터에서 편집된 후 자동 매핑 다시 적용
+        if mapping_available:
+            use_auto_map_state = st.session_state.get("use_auto_map_checkbox", True)
+            
+            if use_auto_map_state:
+                # 매핑 딕셔너리 재생성
+                mapping_dict_post = {}
+                for _, row in mapping_df.iterrows():
+                    task_type = str(row["task_type"]).strip()
+                    hazard_codes = str(row["hazard_codes"]).strip() if pd.notna(row["hazard_codes"]) else ""
+                    if task_type and hazard_codes:
+                        mapping_dict_post[task_type] = hazard_codes
+                
+                if mapping_dict_post:
+                    for idx, row in merged_display_df.iterrows():
+                        t_type = str(row.get("task_type", "")).strip()
+                        existing_codes = row.get("hazard_codes", "")
+                        
+                        # hazard_codes가 비어있으면 매핑 적용
+                        if (not existing_codes or existing_codes == "" or 
+                            (isinstance(existing_codes, str) and existing_codes.strip() == "")):
+                            if t_type in mapping_dict_post:
+                                merged_display_df.at[idx, "hazard_codes"] = mapping_dict_post[t_type]
+        
+        st.session_state["schedule_editor_df"] = ensure_schedule_dtypes(merged_display_df)
+
+        if st.button("공정 입력 완료 (시스템 입력)", use_container_width=True):
+            # 저장 전에 위험요소 매핑 적용
+            committed_df = st.session_state["schedule_editor_df"].copy()
+            
+            # 매핑 파일이 있으면 자동 매핑 적용
+            try:
+                if mapping_df is not None and not mapping_df.empty and "task_type" in committed_df.columns:
+                    mapping_dict = {}
+                    for _, row in mapping_df.iterrows():
+                        task_type = str(row.get("task_type", "")).strip()
+                        hazard_codes = str(row.get("hazard_codes", "")).strip() if pd.notna(row.get("hazard_codes")) else ""
+                        if task_type and hazard_codes:
+                            mapping_dict[task_type] = hazard_codes
+                    
+                    if mapping_dict:
+                        for idx, row in committed_df.iterrows():
+                            t_type = str(row.get("task_type", "")).strip()
+                            existing_codes = row.get("hazard_codes", "")
+                            
+                            # hazard_codes가 비어있으면 매핑 적용
+                            if (not existing_codes or existing_codes == [] or 
+                                (isinstance(existing_codes, str) and existing_codes.strip() == "")):
+                                if t_type in mapping_dict:
+                                    # 문자열을 리스트로 변환
+                                    codes = [c.strip() for c in mapping_dict[t_type].split(",") if c.strip()]
+                                    committed_df.at[idx, "hazard_codes"] = codes
+            except (NameError, Exception) as e:
+                print(f"[경고] 매핑 적용 중 오류: {e}")
+            
+            st.session_state["schedule_committed_df"] = committed_df
+            st.session_state["schedule_committed_at"] = dt.datetime.now()
+            st.success("✅ 시스템 입력 공정을 저장했습니다.")
+        st.caption("시스템 입력 방식에서는 위탭에서 공정·공정 유형을 선택하세요.")
+        return
+
+    schedule_editor_df = ensure_schedule_dtypes(st.session_state["schedule_editor_df"])
+    preview_columns = [
+        "task_id",
+        "task_name",
+        "task_type",
+        "zone",
+        "planned_start",
+        "planned_end",
+        "hazard_codes",
+    ]
+    preview_df = schedule_editor_df.reindex(columns=preview_columns).copy()
+    if "hazard_codes" in preview_df.columns:
+        preview_df["hazard_codes"] = preview_df["hazard_codes"].apply(
+            lambda value: ", ".join(value)
+            if isinstance(value, (list, tuple, set))
+            else ("" if pd.isna(value) else str(value))
+        )
+    for col in ["planned_start", "planned_end"]:
+        if col in preview_df.columns:
+            preview_df[col] = preview_df[col].apply(
+                lambda d: (
+                    "" if pd.isna(d)
+                    else d.strftime("%Y-%m-%d") if isinstance(d, (dt.date, pd.Timestamp))
+                    else str(d)
+                )
+            )
+
+    if entry_mode == "엑셀 업로드":
+        st.markdown("##### 업로드된 공정표 미리보기")
+        if preview_df.empty:
+            st.info("업로드된 공정표가 없습니다. 좌측 사이드바에서 공정표를 업로드해 주세요.")
+        else:
+            st.dataframe(preview_df, use_container_width=True, hide_index=True)
+
+        if st.session_state.get("schedule_source_filename"):
+            st.success(
+                f"현재 적용 중인 공정표: {st.session_state['schedule_source_filename']}",
+                icon="📂",
+            )
+        else:
+            st.caption("공정표를 업로드하면 계산에 자동으로 반영됩니다.")
+
+        status_cols = st.columns(2)
+        status_cols[0].metric("업로드된 공정 수", len(preview_df))
+        status_cols[1].metric(
+            "계산에 적용된 공정 수",
+            len(st.session_state.get("schedule_committed_df", pd.DataFrame())),
+        )
+        return
+
+    controls_col1, controls_col2, _ = st.columns([0.25, 0.25, 0.5])
+    with controls_col1:
+        reset_schedule = st.button("공정 전체 삭제", key="schedule_reset_button", use_container_width=True)
+    with controls_col2:
+        commit_schedule = st.button("공정 입력 완료", key="schedule_commit_button", use_container_width=True, type="primary")
+
+    if reset_schedule:
+        st.session_state["schedule_editor_df"] = pd.DataFrame(columns=SCHEDULE_COLUMNS)
+        st.session_state["schedule_committed_df"] = pd.DataFrame(columns=SCHEDULE_COLUMNS)
+        st.session_state["schedule_committed_at"] = None
+    elif commit_schedule:
+        # 저장 전에 위험요소 매핑 적용
+        committed_df = st.session_state["schedule_editor_df"].copy()
+        
+        # 매핑 파일이 있으면 자동 매핑 적용
+        try:
+            if mapping_df is not None and not mapping_df.empty and "task_type" in committed_df.columns:
+                mapping_dict = {}
+                for _, row in mapping_df.iterrows():
+                    task_type = str(row.get("task_type", "")).strip()
+                    hazard_codes = str(row.get("hazard_codes", "")).strip() if pd.notna(row.get("hazard_codes")) else ""
+                    if task_type and hazard_codes:
+                        mapping_dict[task_type] = hazard_codes
+                
+                if mapping_dict:
+                    mapped_count = 0
+                    for idx, row in committed_df.iterrows():
+                        t_type = str(row.get("task_type", "")).strip()
+                        existing_codes = row.get("hazard_codes", "")
+                        
+                        # hazard_codes가 비어있으면 매핑 적용
+                        if (not existing_codes or existing_codes == [] or 
+                            (isinstance(existing_codes, str) and existing_codes.strip() == "")):
+                            if t_type in mapping_dict:
+                                # 문자열을 리스트로 변환
+                                codes = [c.strip() for c in mapping_dict[t_type].split(",") if c.strip()]
+                                committed_df.at[idx, "hazard_codes"] = codes
+                                mapped_count += 1
+                    
+                    if mapped_count > 0:
+                        st.success(f"✅ {mapped_count}개 공정에 위험코드가 자동 매핑되어 저장되었습니다.")
+        except (NameError, Exception) as e:
+            print(f"[경고] 매핑 적용 중 오류: {e}")
+        
+        st.session_state["schedule_committed_df"] = committed_df
+        st.session_state["schedule_committed_at"] = dt.datetime.now()
+
+    schedule_editor_df = ensure_schedule_dtypes(st.session_state["schedule_editor_df"])
+    existing_task_names = set()
+    if "task_name" in schedule_editor_df.columns:
+        existing_task_names = {
+            str(val).strip()
+            for val in schedule_editor_df["task_name"].dropna()
+            if str(val).strip()
+        }
+    task_name_select_options = sorted(set(TASK_TYPE_OPTIONS.keys()).union(existing_task_names))
+
+    existing_task_types = set()
+    if "task_type" in schedule_editor_df.columns:
+        existing_task_types = {
+            str(val).strip()
+            for val in schedule_editor_df["task_type"].dropna()
+            if str(val).strip()
+        }
+    flat_defined_types = {opt for opts in TASK_TYPE_OPTIONS.values() for opt in opts}
+    task_type_select_options = [""] + sorted(flat_defined_types.union(existing_task_types) - {""})
+
+    type_options_column = []
+    for _, row in schedule_editor_df.iterrows():
+        task_name_value = str(row.get("task_name", "")).strip()
+        allowed = TASK_TYPE_OPTIONS.get(task_name_value, [])
+        type_options_column.append(allowed)
+
+    for idx, allowed in enumerate(type_options_column):
+        if not allowed:
+            continue
+        current_type = str(schedule_editor_df.at[idx, "task_type"]).strip()
+        if current_type not in allowed and allowed:
+            schedule_editor_df.at[idx, "task_type"] = allowed[0]
+
+    base_schedule_df = schedule_editor_df.copy()
+
+    def _format_editor_dataframe(source_df: pd.DataFrame) -> pd.DataFrame:
+        display_columns = [
+            "task_id",
+            "task_name",
+            "task_type",
+            "zone",
+            "planned_start",
+            "planned_end",
+            "hazard_codes",
+        ]
+        formatted = source_df.reindex(columns=display_columns).copy()
+        if "hazard_codes" in formatted.columns:
+            formatted["hazard_codes"] = formatted["hazard_codes"].fillna("")
+            formatted["hazard_codes"] = formatted["hazard_codes"].astype(str).apply(
+                lambda value: (
+                    ", ".join(value)
+                    if isinstance(value, (list, tuple, set))
+                    else ("" if pd.isna(value) else str(value).strip())
+                )
+            )
+        return formatted
+
+    def _restore_hidden_columns(edited_df: pd.DataFrame, base_df: pd.DataFrame) -> pd.DataFrame:
+        display_columns = ["task_id", "task_name", "task_type", "zone", "planned_start", "planned_end", "hazard_codes"]
+        hidden_columns = [col for col in base_df.columns if col not in display_columns]
+        hidden_defaults = {"crew_count": 0, "actual_start": None, "actual_end": None}
+        if hidden_columns:
+            hidden_frame = base_df.reindex(edited_df.index)[hidden_columns]
+        else:
+            hidden_frame = pd.DataFrame(index=edited_df.index)
+        for col in hidden_columns:
+            default_value = hidden_defaults.get(col, None)
+            if col not in hidden_frame:
+                hidden_frame[col] = default_value
+            else:
+                if default_value is None:
+                    hidden_frame[col] = hidden_frame[col].where(~hidden_frame[col].isna(), None)
+                else:
+                    hidden_frame[col] = hidden_frame[col].fillna(default_value)
+        return pd.concat([edited_df, hidden_frame], axis=1)
+
+    category_names = list(TASK_TYPE_OPTIONS.keys())
+    tabs = st.tabs(category_names + ["기타"])
+    updated_segments: list[pd.DataFrame] = []
+
+    for tab, category_name in zip(tabs[:-1], category_names):
+        with tab:
+            category_df = base_schedule_df[base_schedule_df["task_name"] == category_name].copy()
+            formatted_df = _format_editor_dataframe(category_df)
+            category_editor_df = st.data_editor(
+                formatted_df,
+                num_rows="dynamic",
+                use_container_width=True,
+                column_config={
+                    "task_id": st.column_config.TextColumn("공정 ID", help="예: T-01"),
+                    "task_name": st.column_config.TextColumn(
+                        "공정 명",
+                        disabled=True,
+                        help=f"이 탭에서는 '{category_name}' 공정만 편집할 수 있습니다.",
+                        default=category_name,
+                    ),
+                    "task_type": st.column_config.SelectboxColumn(
+                        "공정 유형",
+                        options=TASK_TYPE_OPTIONS.get(category_name, []),
+                        help=f"{category_name} 공정에 해당하는 유형만 선택할 수 있습니다.",
+                    ),
+                    "zone": st.column_config.TextColumn("구역", help="예: B1 존"),
+                    "planned_start": st.column_config.DateColumn("계획 시작", format="YYYY-MM-DD"),
+                    "planned_end": st.column_config.DateColumn("계획 종료", format="YYYY-MM-DD"),
+                    "hazard_codes": st.column_config.TextColumn(
+                        "hazard_codes",
+                        help="쉼표로 구분된 위험 코드 목록을 입력하세요. 예: 120202,210103",
+                    ),
+                },
+                key=f"schedule_editor_table_{category_name}",
+            )
+            category_editor_df["task_name"] = category_name
+            updated_segments.append(category_editor_df)
+
+    with tabs[-1]:
+        other_df = base_schedule_df[~base_schedule_df["task_name"].isin(category_names)].copy()
+        formatted_df = _format_editor_dataframe(other_df)
+        other_editor_df = st.data_editor(
+            formatted_df,
+            num_rows="dynamic",
+            use_container_width=True,
+            column_config={
+                "task_id": st.column_config.TextColumn("공정 ID", help="예: T-01"),
+                "task_name": st.column_config.SelectboxColumn(
+                    "공정 명",
+                    options=category_names,
+                    help="카테고리를 선택하면 해당 탭으로 이동해 편집하는 것이 좋습니다.",
+                ),
+                "task_type": st.column_config.TextColumn("공정 유형"),
+                "zone": st.column_config.TextColumn("구역", help="예: B1 존"),
+                "planned_start": st.column_config.DateColumn("계획 시작", format="YYYY-MM-DD"),
+                "planned_end": st.column_config.DateColumn("계획 종료", format="YYYY-MM-DD"),
+                "hazard_codes": st.column_config.TextColumn(
+                    "hazard_codes",
+                    help="쉼표로 구분된 위험 코드 목록을 입력하세요. 예: 120202,210103",
+                ),
+            },
+            key="schedule_editor_table_other",
+        )
+        updated_segments.append(other_editor_df)
+
+    merged_display_df = pd.concat(updated_segments, ignore_index=True)
+    merged_display_df = _restore_hidden_columns(merged_display_df, base_schedule_df)
+
+    allowed_task_names = list(TASK_TYPE_OPTIONS.keys())
+
+    def _normalize_task_name_value(value: object) -> str:
+        if value is None or (isinstance(value, float) and pd.isna(value)):
+            return allowed_task_names[0]
+        text = str(value).strip()
+        if text in TASK_TYPE_OPTIONS:
+            return text
+        return allowed_task_names[0]
+
+    merged_display_df["task_name"] = merged_display_df["task_name"].apply(_normalize_task_name_value)
+
+    if "hazard_codes" in merged_display_df.columns:
+        merged_display_df["hazard_codes"] = merged_display_df["hazard_codes"].apply(normalize_hazard_code_cell)
+    schedule_editor_df = ensure_schedule_dtypes(merged_display_df)
+
+    if "hazard_codes" in schedule_editor_df.columns:
+        schedule_editor_df["hazard_codes"] = schedule_editor_df["hazard_codes"].apply(normalize_hazard_code_cell)
+    schedule_editor_df = ensure_schedule_dtypes(schedule_editor_df)
+
+    for idx, row in schedule_editor_df.iterrows():
+        task_name_value = str(row.get("task_name", "")).strip()
+        allowed = TASK_TYPE_OPTIONS.get(task_name_value, [])
+        if not allowed:
+            schedule_editor_df.at[idx, "task_type"] = ""
+        else:
+            current_type = str(row.get("task_type", "")).strip()
+            if current_type not in allowed:
+                schedule_editor_df.at[idx, "task_type"] = allowed[0]
+
+    schedule_editor_df = ensure_schedule_dtypes(schedule_editor_df)
+    st.session_state["schedule_editor_df"] = schedule_editor_df
+
+    preview_columns = ["task_id", "task_name", "task_type", "zone", "planned_start", "planned_end", "hazard_codes"]
+    preview_df = schedule_editor_df.reindex(columns=preview_columns).copy()
+    if "hazard_codes" in preview_df.columns:
+        preview_df["hazard_codes"] = preview_df["hazard_codes"].apply(
+            lambda value: ", ".join(value) if isinstance(value, (list, tuple, set)) else ("" if pd.isna(value) else str(value))
+        )
+    for col in ["planned_start", "planned_end"]:
+        if col in preview_df.columns:
+            preview_df[col] = preview_df[col].apply(
+                lambda d: (
+                    d.strftime("%Y-%m-%d")
+                    if isinstance(d, (dt.date, pd.Timestamp))
+                    else ("" if pd.isna(d) else str(d))
+                )
+            )
+
+    st.markdown("##### 업로드된 공정표 미리보기")
+    st.dataframe(preview_df, use_container_width=True, hide_index=True)
+
+    st.caption("행을 추가하거나 삭제해 공정을 입력하세요. 위험코드는 쉼표로 구분된 코드 목록입니다.")
+    if st.session_state.get("schedule_source_filename"):
+        st.info(
+            f"최근 업로드된 공정표: {st.session_state['schedule_source_filename']}",
+            icon="📂",
+        )
+    if st.session_state["schedule_committed_at"]:
+        st.success(
+            f"공정 입력 완료: {st.session_state['schedule_committed_at'].strftime('%Y-%m-%d %H:%M:%S')} 기준 데이터가 저장되었습니다."
+        )
+    elif not schedule_editor_df.empty:
+        st.warning("공정 입력 완료 버튼을 눌러야 계산에 사용할 공정이 저장됩니다.")
+    else:
+        st.info("공정을 추가한 뒤 공정 입력 완료 버튼을 눌러주세요.")
+
+
+if schedule_file is not None:
+    try:
+        file_name = schedule_file.name
+        schedule_file.seek(0)
+        if file_name.lower().endswith(".csv"):
+            schedule_raw_df = pd.read_csv(schedule_file)
+        else:
+            schedule_raw_df = load_schedule_from_excel(schedule_file)
+    except Exception as exc:
+        schedule_file_message.error(f"공정표를 불러오지 못했습니다: {exc}")
+    else:
+        schedule_prepared_df = prepare_schedule_dataframe(schedule_raw_df)
+        if schedule_prepared_df.empty:
+            schedule_file_message.warning("공정표에서 유효한 공정 데이터를 찾을 수 없습니다. 필수 열을 확인하세요.")
+        else:
+            st.session_state["schedule_editor_df"] = ensure_schedule_dtypes(schedule_prepared_df)
+            st.session_state["schedule_committed_df"] = schedule_prepared_df.copy()
+            st.session_state["schedule_committed_at"] = dt.datetime.now()
+            st.session_state["schedule_source_filename"] = file_name
+            schedule_file_message.success(f"'{file_name}'에서 {len(schedule_prepared_df)}건의 공정을 불러왔습니다.")
+elif st.session_state.get("schedule_source_filename"):
+    schedule_file_message.info(
+        f"현재 적용 중인 공정표: {st.session_state['schedule_source_filename']}",
+        icon="📂",
+    )
+else:
+    schedule_file_message.info("공정표 파일이 업로드되지 않았습니다.")
+
+
+def get_effective_mapping_df(user_mapping_df: pd.DataFrame | None) -> pd.DataFrame:
+    """
+    사용자가 업로드한 매핑 파일과 기본 매핑을 결합합니다.
+    사용자 매핑이 우선순위를 가집니다.
+    
+    Args:
+        user_mapping_df: 사용자가 업로드한 매핑 DataFrame (None 가능)
+    
+    Returns:
+        결합된 매핑 DataFrame
+    """
+    # 기본 매핑을 DataFrame으로 변환
+    default_mapping_rows = []
+    for task_type, hazard_codes in DEFAULT_HAZARD_MAPPING.items():
+        default_mapping_rows.append({
+            "task_type": task_type,
+            "hazard_codes": hazard_codes,
+            "source": "기본 매핑"
+        })
+    default_df = pd.DataFrame(default_mapping_rows)
+    
+    # 사용자 매핑이 없으면 기본 매핑만 반환
+    if user_mapping_df is None or user_mapping_df.empty:
+        print("[매핑] 기본 위험요소 매핑 사용 (사용자 매핑 파일 없음)")
+        return default_df
+    
+    # 사용자 매핑이 있으면 결합 (사용자 매핑 우선)
+    if "task_type" not in user_mapping_df.columns or "hazard_codes" not in user_mapping_df.columns:
+        print("[매핑] 사용자 매핑 파일 형식 오류, 기본 매핑만 사용")
+        return default_df
+    
+    # 사용자 매핑에 source 컬럼 추가
+    user_df = user_mapping_df.copy()
+    user_df["source"] = "사용자 업로드"
+    
+    # 사용자 매핑과 기본 매핑 결합 (사용자가 정의한 task_type은 제외)
+    user_task_types = set(user_df["task_type"].dropna().astype(str).str.strip().tolist())
+    default_df_filtered = default_df[~default_df["task_type"].isin(user_task_types)]
+    
+    # 결합
+    combined_df = pd.concat([user_df, default_df_filtered], ignore_index=True)
+    
+    user_count = len(user_df)
+    default_count = len(default_df_filtered)
+    print(f"[매핑] 사용자 매핑 {user_count}개 + 기본 매핑 {default_count}개 = 총 {len(combined_df)}개 공정 유형 사용")
+    
+    return combined_df
+
 
 def build_hazard_mapping_table(mapping_df: pd.DataFrame | None) -> pd.DataFrame:
     """
@@ -1654,8 +3313,19 @@ def compute_I_for_task(day, row, mu, xi, k):
     시간누적 증가항 I 구성요소: 각 코드별 a_i0 * ((|x-μ|)/(ξ-μ))^k
     여기서 x = (지연일수) = max(0, min(day, actual_end) - planned_end)
     """
-    planned_end = row["planned_end"]
-    actual_end  = row["actual_end"]
+    planned_end = row.get("planned_end")
+    actual_end  = row.get("actual_end")
+
+    if isinstance(planned_end, pd.Timestamp):
+        planned_end = planned_end.date()
+    if isinstance(actual_end, pd.Timestamp):
+        actual_end = actual_end.date()
+
+    if pd.isna(planned_end):
+        planned_end = None
+    if pd.isna(actual_end):
+        actual_end = None
+
     if actual_end is None or planned_end is None:
         return 0.0
 
@@ -1730,7 +3400,7 @@ def apply_conservative_mitigation(
     [지수 감쇠 버전 - fallback 없음]
     - '점검 완료'와 '조치 선택'이 모두 이루어진 날짜를 이벤트로 보고
     - 그 이후 날짜들에 대해 exp(-lambda * 경과일수)를 곱해
-      R1(H/F/E), R2(M), R_total을 감소시킨다.
+      인적/설비/환경 위험도, 관리적 위험도, 종합 위험도을 감소시킨다.
     - 세부 조치를 선택하지 않았고 category에도 파라미터가 없으면
       해당 점검일은 효과를 주지 않는다.
     """
@@ -1817,18 +3487,18 @@ def apply_conservative_mitigation(
         factor_r1 = max(0.0, min(1.0, factor_r1))
         factor_r2 = max(0.0, min(1.0, factor_r2))
 
-        base_r1 = float(row.get("R1(H/F/E)", 0.0) or 0.0)
-        base_r2 = float(row.get("R2(M)", 0.0) or 0.0)
-        base_total = float(row.get("R_total", 0.0) or 0.0)
+        base_r1 = float(row.get("인적/설비/환경 위험도", 0.0) or 0.0)
+        base_r2 = float(row.get("관리적 위험도", 0.0) or 0.0)
+        base_total = float(row.get("종합 위험도", 0.0) or 0.0)
 
         new_r1 = base_r1 * factor_r1
         new_r2 = base_r2 * factor_r2
         factor_total = min(factor_r1, factor_r2)
         new_total = base_total * factor_total
 
-        df.at[idx, "R1(H/F/E)"] = new_r1
-        df.at[idx, "R2(M)"] = new_r2
-        df.at[idx, "R_total"] = new_total
+        df.at[idx, "인적/설비/환경 위험도"] = new_r1
+        df.at[idx, "관리적 위험도"] = new_r2
+        df.at[idx, "종합 위험도"] = new_total
         df.at[idx, "level"] = risk_level(new_r1, new_r2)
 
     return df
@@ -1867,21 +3537,21 @@ def build_threshold_alerts(df):
     thresh_r2 = get_threshold_r2()
     for _, row in df.iterrows():
         reasons = []
-        if row["R1(H/F/E)"] >= thresh_r1:
+        if row["인적/설비/환경 위험도"] >= thresh_r1:
             reasons.append(f"R1 ≥ {thresh_r1:.3f}")
-        if row["R2(M)"] >= thresh_r2:
+        if row["관리적 위험도"] >= thresh_r2:
             reasons.append(f"R2 ≥ {thresh_r2:.3f}")
         if reasons:
             alerts.append({
                 "점검일시": row["date"],
                 "위험레벨": row["level"],
                 "초과지표": ", ".join(reasons),
-                "R_total": row["R_total"],
-                "R1(H/F/E)": row["R1(H/F/E)"],
-                "R2(M)": row["R2(M)"],
+                "종합 위험도": row["종합 위험도"],
+                "인적/설비/환경 위험도": row["인적/설비/환경 위험도"],
+                "관리적 위험도": row["관리적 위험도"],
             })
     if not alerts:
-        return pd.DataFrame(columns=["점검일시", "위험레벨", "초과지표", "R_total", "R1(H/F/E)", "R2(M)"])
+        return pd.DataFrame(columns=["점검일시", "위험레벨", "초과지표", "종합 위험도", "인적/설비/환경 위험도", "관리적 위험도"])
     return pd.DataFrame(alerts).sort_values("점검일시")
 
 def prepare_alert_table(base_alerts, adjusted_daily, checks, actions):
@@ -1895,30 +3565,30 @@ def prepare_alert_table(base_alerts, adjusted_daily, checks, actions):
     columns = [
         "번호", "점검완료", "감소조치(대분류)", "감소조치(세부항목)", "점검일시", "초과지표",
         "기준 위험레벨", "현재 위험레벨",
-        "기준 R_total", "현재 R_total",
-        "기준 R1(H/F/E)", "현재 R1(H/F/E)",
-        "기준 R2(M)", "현재 R2(M)",
+        "기준 종합 위험도", "현재 종합 위험도",
+        "기준 인적/설비/환경 위험도", "현재 인적/설비/환경 위험도",
+        "기준 관리적 위험도", "현재 관리적 위험도",
     ]
     if base_alerts.empty:
-        return pd.DataFrame(columns=columns)
+        return pd.DataFrame(columns=columns + ["기준 임계 초과", "현재 임계 초과"])
 
     table = base_alerts.rename(columns={
         "위험레벨": "기준 위험레벨",
-        "R_total": "기준 R_total",
-        "R1(H/F/E)": "기준 R1(H/F/E)",
-        "R2(M)": "기준 R2(M)",
+        "종합 위험도": "기준 종합 위험도",
+        "인적/설비/환경 위험도": "기준 인적/설비/환경 위험도",
+        "관리적 위험도": "기준 관리적 위험도",
     }).copy()
 
     table = table.merge(
-        adjusted_daily[["date", "R_total", "R1(H/F/E)", "R2(M)", "level"]],
+        adjusted_daily[["date", "종합 위험도", "인적/설비/환경 위험도", "관리적 위험도", "level"]],
         left_on="점검일시",
         right_on="date",
         how="left"
     )
     table.rename(columns={
-        "R_total": "현재 R_total",
-        "R1(H/F/E)": "현재 R1(H/F/E)",
-        "R2(M)": "현재 R2(M)",
+        "종합 위험도": "현재 종합 위험도",
+        "인적/설비/환경 위험도": "현재 인적/설비/환경 위험도",
+        "관리적 위험도": "현재 관리적 위험도",
         "level": "현재 위험레벨",
     }, inplace=True)
     table.drop(columns=["date"], inplace=True)
@@ -1962,9 +3632,9 @@ def prepare_alert_table(base_alerts, adjusted_daily, checks, actions):
     table.insert(3, "감소조치(세부항목)", table["점검일시"].apply(_action_detail_label))
 
     float_cols = [
-        "기준 R_total", "현재 R_total",
-        "기준 R1(H/F/E)", "현재 R1(H/F/E)",
-        "기준 R2(M)", "현재 R2(M)",
+        "기준 종합 위험도", "현재 종합 위험도",
+        "기준 인적/설비/환경 위험도", "현재 인적/설비/환경 위험도",
+        "기준 관리적 위험도", "현재 관리적 위험도",
     ]
     for col in float_cols:
         if col in table.columns:
@@ -1974,10 +3644,10 @@ def prepare_alert_table(base_alerts, adjusted_daily, checks, actions):
     thresh_r2 = get_threshold_r2()
 
     table["기준 임계 초과"] = (
-        (table["기준 R1(H/F/E)"] >= thresh_r1) | (table["기준 R2(M)"] >= thresh_r2)
+        (table["기준 인적/설비/환경 위험도"] >= thresh_r1) | (table["기준 관리적 위험도"] >= thresh_r2)
     )
     table["현재 임계 초과"] = (
-        (table["현재 R1(H/F/E)"] >= thresh_r1) | (table["현재 R2(M)"] >= thresh_r2)
+        (table["현재 인적/설비/환경 위험도"] >= thresh_r1) | (table["현재 관리적 위험도"] >= thresh_r2)
     )
 
     return table[columns + ["기준 임계 초과", "현재 임계 초과"]]
@@ -1985,80 +3655,133 @@ def prepare_alert_table(base_alerts, adjusted_daily, checks, actions):
 # ==========================
 # 3) 데이터 로딩
 # ==========================
-mapping_df = None
+user_mapping_df = None
 mapping_table_df = pd.DataFrame()
 
-if sch_file is not None and wea_file is not None:
-    sch = pd.read_excel(sch_file)
-    wea = pd.read_excel(wea_file)
+if mapping_file is not None:
+    try:
+        user_mapping_df = pd.read_excel(mapping_file)
+    except Exception:
+        user_mapping_df = None
 
-    # 위험요인 매핑 엑셀 로드 (선택)
-    if "mapping_file" in globals() and mapping_file is not None:
-        try:
-            mapping_df = pd.read_excel(mapping_file)
-        except Exception:
-            mapping_df = None
-    mapping_table_df = build_hazard_mapping_table(mapping_df)
+# 사용자 매핑 + 기본 매핑을 결합 (사용자 매핑 우선)
+mapping_df = get_effective_mapping_df(user_mapping_df)
 
-    # 표준화
-    sch = sch.rename(columns={
-        "task_id":"task_id",
-        "task_name":"task_name",
-        "zone":"zone",
-        "planned_start":"planned_start",
-        "planned_end":"planned_end",
-        "actual_end":"actual_end",
-        "hazard_codes":"hazard_codes"
-    })
-    # hazard_codes 컬럼이 없으면 생성
-    if "hazard_codes" not in sch.columns:
-        sch["hazard_codes"] = np.nan
+mapping_table_df = build_hazard_mapping_table(mapping_df)
 
-    # 별도 매핑 엑셀을 통한 hazard_codes 자동 부여
-    if mapping_df is not None and "task_type" in sch.columns:
-        if "task_type" in mapping_df.columns and "hazard_codes" in mapping_df.columns:
-            # 문자열로 정규화
-            sch["task_type"] = sch["task_type"].astype(str)
-            mapping_df_local = mapping_df[["task_type", "hazard_codes"]].copy()
-            mapping_df_local["task_type"] = mapping_df_local["task_type"].astype(str)
+schedule_source_df = st.session_state.get("schedule_committed_df")
+if schedule_source_df is None or schedule_source_df.empty:
+    sch = pd.DataFrame(columns=SCHEDULE_COLUMNS)
+else:
+    sch = prepare_schedule_dataframe(schedule_source_df)
+
+if mapping_df is not None and not mapping_df.empty and not sch.empty and "task_type" in sch.columns:
+    if "task_type" in mapping_df.columns and "hazard_codes" in mapping_df.columns:
+        mapping_df_local = mapping_df[["task_type", "hazard_codes"]].copy()
+        mapping_df_local.dropna(subset=["task_type", "hazard_codes"], how="any", inplace=True)
+        if not mapping_df_local.empty:
+            mapping_df_local["task_type"] = mapping_df_local["task_type"].astype(str).str.strip()
             mapping_df_local["hazard_codes"] = mapping_df_local["hazard_codes"].astype(str)
-            # task_type 기준 병합
+            sch["task_type"] = sch["task_type"].astype(str).str.strip()
+            
+            # 매핑 파일과 병합
             sch = sch.merge(mapping_df_local, on="task_type", how="left", suffixes=("", "_map"))
-            # 사용자가 공정표에 hazard_codes를 비워둔 경우에만 매핑값 채우기
-            def _fill_hazard_codes(row):
-                val = row.get("hazard_codes")
-                if val is None or (isinstance(val, float) and np.isnan(val)) or str(val).strip() == "":
-                    return row.get("hazard_codes_map")
-                return val
-            sch["hazard_codes"] = sch.apply(_fill_hazard_codes, axis=1)
+            
+            # hazard_codes_map이 있으면 적용
             if "hazard_codes_map" in sch.columns:
+                # 매핑 전 상태 저장 (디버깅용)
+                print(f"[디버그] 매핑 전 공정 수: {len(sch)}")
+                print(f"[디버그] 매핑 파일의 task_type: {mapping_df_local['task_type'].tolist()}")
+                print(f"[디버그] 공정표의 task_type: {sch['task_type'].unique().tolist()}")
+                
+                # 실제로 매핑된 개수를 추적하기 위한 리스트 사용
+                mapped_results = {"count": 0}
+                
+                # 기존 hazard_codes가 비어있는 경우 매핑된 값 사용
+                def apply_mapping(row):
+                    # 기존 hazard_codes 확인
+                    existing = row.get("hazard_codes", [])
+                    mapped = row.get("hazard_codes_map")
+                    
+                    # 디버깅: 각 행의 상태 출력
+                    task_name = row.get("task_name", "")
+                    task_type = row.get("task_type", "")
+                    
+                    # 기존 값이 비어있거나 없으면 매핑된 값 사용
+                    is_empty = (not existing or existing == [] or existing == "" or 
+                                (isinstance(existing, list) and len(existing) == 0))
+                    
+                    if is_empty:
+                        if pd.notna(mapped) and str(mapped).strip() != "":
+                            # 쉼표로 구분된 문자열을 리스트로 변환
+                            new_codes = [code.strip() for code in str(mapped).split(",") if code.strip()]
+                            if new_codes:
+                                mapped_results["count"] += 1
+                                print(f"[디버그] ✅ 매핑 성공: '{task_name}' (유형: {task_type}) -> {new_codes}")
+                                return new_codes
+                        else:
+                            print(f"[디버그] ⚠️ 매핑 실패: '{task_name}' (유형: {task_type}) - 매핑 파일에 없음")
+                    else:
+                        print(f"[디버그] ⏭️ 건너뜀: '{task_name}' (유형: {task_type}) - 이미 값 존재: {existing}")
+                    
+                    return existing if existing else []
+                
+                sch["hazard_codes"] = sch.apply(apply_mapping, axis=1)
                 sch.drop(columns=["hazard_codes_map"], inplace=True)
+                
+                # 매핑 결과 출력
+                print(f"[매핑] 위험요소 매핑 파일을 기반으로 {mapped_results['count']}개 공정에 위험 코드가 자동 매핑되었습니다.")
 
-    # 날짜 변환
-    for col in ["planned_start","planned_end","actual_end"]:
-        sch[col] = sch[col].apply(to_date)
-    # 코드 리스트 변환
-    sch["hazard_codes"] = sch["hazard_codes"].apply(parse_codes)
+if not sch.empty:
+    sch = ensure_hazard_codes_column(sch)
+    if "actual_end" not in sch.columns:
+        sch["actual_end"] = sch["planned_end"]
+    else:
+        sch["actual_end"] = sch["actual_end"].apply(
+            lambda x: to_date(x) if x not in (None, "", "NaT") and not pd.isna(x) else None
+        )
+        sch["actual_end"] = sch["actual_end"].fillna(sch["planned_end"])
 
+wea = None
+if wea_file is not None:
+    try:
+        wea = pd.read_excel(wea_file)
+    except Exception:
+        wea = None
+
+if wea is not None and not wea.empty:
     wea = wea.rename(columns={
-        "date":"date","address":"address",
-        "daily_rain_mm":"daily_rain_mm",
-        "max_wind_ms":"max_wind_ms",
-        "avg_temp_C":"avg_temp_C"
+        "date": "date",
+        "address": "address",
+        "daily_rain_mm": "daily_rain_mm",
+        "max_wind_ms": "max_wind_ms",
+        "avg_temp_C": "avg_temp_C",
     })
-    wea["date"] = wea["date"].apply(to_date)
+    if "date" in wea.columns:
+        wea["date"] = wea["date"].apply(to_date)
+        weather_lines = build_weather_summary(wea, ref_date=current_datetime.date())
+        info_placeholder.markdown(
+            render_top_info(
+                st.session_state.get("site_name", DEFAULT_SITE_NAME),
+                st.session_state.get("site_location", DEFAULT_SITE_LOCATION),
+                current_datetime,
+                weather_lines
+            ),
+            unsafe_allow_html=True
+        )
+        st.session_state["weather_loaded"] = True
+    else:
+        wea = None
+        st.session_state["weather_loaded"] = False
+else:
+    wea = None
+    st.session_state["weather_loaded"] = False
 
-    weather_lines = build_weather_summary(wea, ref_date=current_datetime.date())
-    info_placeholder.markdown(
-        render_top_info(
-            st.session_state.get("site_name", DEFAULT_SITE_NAME),
-            st.session_state.get("site_location", DEFAULT_SITE_LOCATION),
-            current_datetime,
-            weather_lines
-        ),
-        unsafe_allow_html=True
-    )
+tabs = []
+trend_tabs = []
+monthly_notes = []
 
+if not sch.empty and wea is not None:
     date_min = min(sch["planned_start"].min(), wea["date"].min())
     date_max = max(sch["planned_end"].max(), wea["date"].max())
     all_days = pd.date_range(start=date_min, end=date_max, freq="D").date
@@ -2133,9 +3856,9 @@ if sch_file is not None and wea_file is not None:
 
         daily_rows.append({
             "date": day,
-            "R_total": R_total,
-            "R1(H/F/E)": R1,
-            "R2(M)": R2,
+            "종합 위험도": R_total,
+            "인적/설비/환경 위험도": R1,
+            "관리적 위험도": R2,
             "RC(AMI)": RC,
             "I(delay)": sum_I_all,
             "rain_mm": rain,
@@ -2153,67 +3876,114 @@ if sch_file is not None and wea_file is not None:
 
     # ---------- UI 전용 뷰 필터(계산 결과 변경 없음) ----------
     st.markdown("<div class='section-title'>요약</div>", unsafe_allow_html=True)
-    summary_cards = [
-        ("기간", f"<span class='metric-value-inline'>{daily_df['date'].min()} ~ {daily_df['date'].max()}</span>", "metric-card metric-span-2"),
-        ("평균 R_total", f"{daily_df['R_total'].mean():.3f}", "metric-card metric-span-1"),
-        ("최대 R1(H/F/E)", f"{daily_df['R1(H/F/E)'].max():.3f}", "metric-card metric-span-1"),
-        ("Level I(빨강) 일수", f"<span class='highlight'>{int((daily_df['level'] == 'Level I (Red)').sum())}</span>", "metric-card metric-span-1"),
-    ]
-    summary_html = "<div class='metric-grid'>" + "".join(
-        f"<div class='{classes}'><div class='metric-label'>{label}</div>"
-        f"<div class='metric-value'>{value_html}</div></div>"
-        for label, value_html, classes in summary_cards
-    ) + "</div>"
-    st.markdown(summary_html, unsafe_allow_html=True)
-
+    
+    # 오늘 날짜 및 데이터 가져오기
     today = dt.date.today()
-    highlight_messages = []
+    today_row = daily_df[daily_df["date"] == today] if not daily_df.empty else pd.DataFrame()
+    today_row_base = daily_df_base[daily_df_base["date"] == today] if not daily_df_base.empty else pd.DataFrame()
+    
+    # 히어로 카드 HTML 시작
+    # 1. 오늘의 주요 위험도
+    r_total_display = "--"
+    r1_display = "--"
+    r2_display = "--"
+    risk_pill_class = "summary-risk-pill muted"
+    risk_pill_icon = "ℹ️"
+    risk_pill_label = "데이터 없음"
+    risk_empty_message = "데이터를 업로드해주세요."
 
-    if not daily_df.empty:
-        today_row = daily_df[daily_df["date"] == today]
-        today_row_base = daily_df_base[daily_df_base["date"] == today]
+    if not today_row.empty:
+        level_text = today_row["level"].iloc[0]
+        r_total_value = float(today_row["종합 위험도"].iloc[0])
+        r1_value = float(today_row["인적/설비/환경 위험도"].iloc[0])
+        r2_value = float(today_row["관리적 위험도"].iloc[0])
 
-        if not today_row.empty:
-            level_text = today_row["level"].iloc[0]
-            level_dict = {
-                "Level I (Red)": "Level I (Red) (즉시 대응 필요)",
-                "Level II (Yellow)": "Level II (Yellow)",
-                "Level III (Blue)": "Level III (Blue)",
-            }
-            highlight_messages.append(
-                f"<strong>오늘 {today:%Y-%m-%d}</strong>은 {level_dict.get(level_text, level_text)} 상태입니다."
-            )
+        r_total_display = f"{r_total_value:.3f}"
+        r1_display = f"{r1_value:.3f}"  
+        r2_display = f"{r2_value:.3f}"
 
-            base_need = False
-            if not today_row_base.empty:
-                base_need = (
-                    today_row_base["R1(H/F/E)"].iloc[0] >= get_threshold_r1() or
-                    today_row_base["R2(M)"].iloc[0] >= get_threshold_r2()
-                )
-            check_key = today.isoformat()
-            checked_today = alert_checks_state.get(check_key, False)
-
-            if base_need and not checked_today:
-                highlight_messages.append("<strong>오늘</strong>은 임계 초과로 점검이 필요한 날입니다.")
-            elif base_need and checked_today:
-                action_label = ""
-                if isinstance(alert_actions_state, dict):
-                    action_record = normalize_action_value(alert_actions_state.get(check_key, {}))
-                    action_label = get_action_display(
-                        action_record.get("category", ""),
-                        action_record.get("detail", ""),
-                    )
-                if action_label:
-                    highlight_messages.append(
-                        f"<strong>오늘</strong> 점검을 완료하고 <em>{action_label}</em> 조치를 적용했습니다."
-                    )
-                else:
-                    highlight_messages.append("<strong>오늘</strong> 점검을 완료하여 위험도가 감소한 상태입니다.")
+        if isinstance(level_text, str) and level_text.startswith("Level I"):
+            risk_pill_class = "summary-risk-pill level-red"
+            risk_pill_icon = "!"
+            risk_pill_label = "Level I: 즉시 대응 필요"
+        elif isinstance(level_text, str) and level_text.startswith("Level II"):
+            risk_pill_class = "summary-risk-pill level-yellow"
+            risk_pill_icon = "⚠️"
+            risk_pill_label = "Level II: 주의 필요"
+        elif isinstance(level_text, str) and level_text.startswith("Level III"):
+            risk_pill_class = "summary-risk-pill"
+            risk_pill_icon = "✓"
+            risk_pill_label = "Level III: 안전"
         else:
-            if today < daily_df['date'].min() or today > daily_df['date'].max():
-                highlight_messages.append(f"<strong>오늘 {today:%Y-%m-%d}</strong>은 업로드된 데이터 기간 밖입니다.")
+            risk_pill_class = "summary-risk-pill"
+            risk_pill_icon = "✓"
+            risk_pill_label = str(level_text)
+
+        risk_empty_message = ""
+    else:
+        if not daily_df.empty:
+            if today < daily_df["date"].min() or today > daily_df["date"].max():
+                risk_empty_message = (
+                    f"오늘 {today:%Y-%m-%d}은 업로드된 데이터 기간"
+                    f"({daily_df['date'].min()} ~ {daily_df['date'].max()}) 밖입니다."
+                )
             else:
-                highlight_messages.append(f"<strong>오늘 {today:%Y-%m-%d}</strong> 데이터가 누락되었습니다. 입력을 확인하세요.")
+                risk_empty_message = f"오늘 {today:%Y-%m-%d} 데이터가 누락되었습니다. 입력을 확인하세요."
+
+    risk_empty_html = (
+        f"<div class='summary-risk-empty'>{html.escape(risk_empty_message)}</div>"
+        if risk_empty_message
+        else ""
+    )
+
+    risk_left_html = (
+        "<div class='summary-risk-left'>"
+        "<div class='summary-risk-display'>"
+        f"<span class='{risk_pill_class}'><span class='icon'>{risk_pill_icon}</span>{risk_pill_label}</span>"
+        "</div>"
+        "</div>"
+    )
+
+    risk_right_html = (
+        "<div class='summary-risk-right'>"
+        "<div class='summary-risk-metrics'>"
+        "<div class='summary-risk-metric-row'>"
+        "<span class='summary-risk-metric-label'>종합 위험도</span>"
+        f"<span class='summary-risk-metric-value'>{r_total_display}</span>"
+        "</div>"
+        "<div class='summary-risk-metric-row'>"
+        "<span class='summary-risk-metric-label'>R1 (H/F/E)</span>"
+        f"<span class='summary-risk-metric-value'>{r1_display}</span>"
+        "</div>"
+        "<div class='summary-risk-metric-row'>"
+        "<span class='summary-risk-metric-label'>R2 (M)</span>"
+        f"<span class='summary-risk-metric-value'>{r2_display}</span>"
+        "</div>"
+        "</div>"
+        "</div>"
+    )
+
+    risk_card_html = (
+        "<div class='summary-card summary-card-risk'>"
+        "<div class='hero-card-header'>"
+        "<div class='summary-title-line'>"
+        "<span class='summary-status-dot'></span>"
+        f"<span>오늘의 주요 위험도 ({today:%Y-%m-%d})</span>"
+        "</div>"
+        "</div>"
+        "<div class='summary-risk-content'>"
+        f"{risk_left_html}"
+        f"{risk_right_html}"
+        "</div>"
+        f"{risk_empty_html}"
+        "</div>"
+    )
+
+    # 2. 오늘의 주요 공정
+    process_icon_symbol = "ℹ️"
+    process_main_text = "공정 정보 없음"
+    process_sub_text = ""
+    process_detail_html = ""
 
     if "sch" in locals() and not sch.empty:
         today_tasks = sch[
@@ -2224,23 +3994,162 @@ if sch_file is not None and wea_file is not None:
         ]
         if not today_tasks.empty:
             task_names = today_tasks["task_name"].dropna().astype(str).tolist()
-            if task_names:
-                display_names = ", ".join(task_names[:3])
-                if len(task_names) > 3:
-                    display_names += f" 외 {len(task_names) - 3}개 공정"
-                highlight_messages.append(f"<strong>오늘 진행 중 공정</strong>: {display_names}")
+            display_names = [html.escape(name) for name in task_names]
+            if display_names:
+                process_icon_symbol = "🛠️"
+                process_main_text = display_names[0]
+                if len(display_names) > 1:
+                    process_sub_text = f"외 {len(display_names) - 1}개 공정"
+
+                max_items = 4
+                items = display_names[:max_items]
+                list_items = "".join(f"<li>{name}</li>" for name in items)
+                if len(display_names) > max_items:
+                    list_items += f"<li>... 외 {len(display_names) - max_items}개 공정</li>"
+                process_detail_html = ""
+            else:
+                process_icon_symbol = "ℹ️"
+                process_main_text = "진행 중인 공정 없음"
+                process_detail_html = ""
         else:
-            highlight_messages.append("<strong>오늘</strong>은 진행 중인 공정이 없습니다.")
+            process_icon_symbol = "ℹ️"
+            process_main_text = "진행 중인 공정 없음"
+            process_detail_html = ""
 
-    highlight_alerts = []
-    for msg in highlight_messages:
-        css_class = "summary-info-card"
-        if any(keyword in msg for keyword in ["Level I", "임계 초과", "즉시 대응", "누락", "기간 밖"]):
-            css_class = "summary-alert-card"
-        highlight_alerts.append((css_class, msg))
+    process_sub_html = ""
 
-    for css_class, msg in highlight_alerts:
-        st.markdown(f"<div class='{css_class}'><p>{msg}</p></div>", unsafe_allow_html=True)
+    process_section_html = (
+        "<div class='summary-lower-left'>"
+        "<div class='summary-title-line'>"
+        "<span class='summary-process-header-icon'>🏗️</span>"
+        "<span>오늘의 주요 공정</span>"
+        "</div>"
+        "<div class='summary-process-card'>"
+        f"<div class='summary-process-icon'>{process_icon_symbol}</div>"
+        "<div>"
+        f"<div class='summary-process-text'>{process_main_text}</div>"
+        "</div>"
+        "</div>"
+        "</div>"
+    )
+
+    # 3. 주의해야하는 사항 (기존 highlight messages 로직 활용)
+    highlight_messages = []
+    
+    if not today_row.empty:
+        # 점검 필요 여부 확인
+        base_need = False
+        if not today_row_base.empty:
+            base_need = (
+                today_row_base["인적/설비/환경 위험도"].iloc[0] >= get_threshold_r1() or
+                today_row_base["관리적 위험도"].iloc[0] >= get_threshold_r2()
+            )
+        check_key = today.isoformat()
+        checked_today = alert_checks_state.get(check_key, False)
+        
+        if base_need and not checked_today:
+            highlight_messages.append("<strong>점검이 필요</strong>한 날입니다.")
+        elif base_need and checked_today:
+            action_label = ""
+            if isinstance(alert_actions_state, dict):
+                action_record = normalize_action_value(alert_actions_state.get(check_key, {}))
+                action_label = get_action_display(
+                    action_record.get("category", ""),
+                    action_record.get("detail", ""),
+                )
+            if action_label:
+                highlight_messages.append(
+                    f"오늘 점검을 완료하고 <em>{action_label}</em> 조치를 적용했습니다."
+                )
+            else:
+                highlight_messages.append("오늘 점검을 완료하여 위험도가 감소한 상태입니다.")
+    
+    # 임계 초과 알림 추가
+    if "sch" in locals() and not sch.empty and not today_row.empty:
+        level_text = today_row["level"].iloc[0]
+        if level_text == "Level I (Red)":
+            highlight_messages.insert(0, "<strong>긴급:</strong> 즉시 대응이 필요합니다!")
+    
+    # 주의사항이 없으면 안전 메시지 표시
+    if not highlight_messages:
+        highlight_messages.append("현재 특별히 주의해야 할 사항이 없습니다. 안전한 작업을 계속하세요.")
+    
+    # 주의사항 카드 HTML 구성
+    alert_keywords = ["Level I", "임계 초과", "즉시 대응", "누락", "기간 밖", "긴급"]
+    highlight_is_alert = any(any(keyword in msg for keyword in alert_keywords) for msg in highlight_messages)
+    warning_class = "summary-warning-card"
+    if highlight_is_alert:
+        warning_class += " alert"
+    warning_icon_symbol = "⚠️" if highlight_is_alert else "ℹ️"
+    highlight_lines_html = "".join(
+        f"<div class='summary-warning-line'>{msg}</div>"
+        for msg in highlight_messages
+    )
+
+    warning_section_html = (
+        "<div class='summary-lower-right'>"
+        "<div class='summary-warning-wrapper'>"
+        "<div class='summary-warning-header'>"
+        "<span class='summary-process-header-icon'>⚠️</span>"
+        "<span>주의해야하는 사항</span>"
+        "</div>"
+        f"<div class='{warning_class}'>"
+        f"<div class='summary-warning-icon'>{warning_icon_symbol}</div>"
+        f"{highlight_lines_html}"
+        "</div>"
+        "</div>"
+        "</div>"
+    )
+
+    lower_card_html = (
+        "<div class='summary-card summary-lower-card'>"
+        f"{process_section_html}"
+        f"{warning_section_html}"
+        "</div>"
+    )
+
+    summary_cards_html = (
+        "<div class='summary-card-grid'>"
+        f"{risk_card_html}"
+        f"{lower_card_html}"
+        "</div>"
+    )
+
+    summary_section_html = (
+        "<div class='summary-wrapper'>"
+        f"{summary_cards_html}"
+        "</div>"
+    )
+    st.markdown(summary_section_html, unsafe_allow_html=True)
+    
+    st.markdown("<div style='height: 20px;'></div>", unsafe_allow_html=True)
+    
+    # 4. 기간 통계 (덜 눈에 띄는 섹션)
+    if not daily_df.empty:
+        period_stats_html = f"""
+        <div class='period-stats'>
+            <div class='period-stats-title'>📊 기간 통계</div>
+            <div class='period-stats-grid'>
+                <div class='period-stat-item'>
+                    <div class='period-stat-label'>분석 기간</div>
+                    <div class='period-stat-value'>{daily_df['date'].min()} ~ {daily_df['date'].max()}</div>
+                </div>
+                <div class='period-stat-item'>
+                    <div class='period-stat-label'>평균 종합 위험도</div>
+                    <div class='period-stat-value'>{daily_df['종합 위험도'].mean():.3f}</div>
+                </div>
+                <div class='period-stat-item'>
+                    <div class='period-stat-label'>최대 인적/설비/환경 위험도</div>
+                    <div class='period-stat-value'>{daily_df['인적/설비/환경 위험도'].max():.3f}</div>
+                </div>
+                <div class='period-stat-item'>
+                    <div class='period-stat-label'>Level I (빨강) 일수</div>
+                    <div class='period-stat-value' style='color: #e11d48;'>{int((daily_df['level'] == 'Level I (Red)').sum())}일</div>
+                </div>
+            </div>
+        </div>
+        """
+        st.markdown(period_stats_html, unsafe_allow_html=True)
 
     st.markdown("<div style='height: 20px;'></div>", unsafe_allow_html=True)
 
@@ -2276,7 +4185,8 @@ if sch_file is not None and wea_file is not None:
         "Level III (Blue)": "#1F6FEB",
     }
 
-    tabs = st.tabs([
+    tab_labels = [
+        "🛠️ 공정 입력",
         "🗂️ 위험요인 매핑",
         "📅 달력 뷰",
         "📈 추세",
@@ -2285,19 +4195,26 @@ if sch_file is not None and wea_file is not None:
         "🌦️ 기상-위험 상관",
         "🔎 데이터",
         "✅ 체크리스트",
-    ])
+    ]
+    st.write("---")
+    st.caption("공정 입력 탭에서 데이터를 확정한 뒤, 다른 탭에서 달력·추세·간트·점검을 확인할 수 있습니다.")
+    tabs = st.tabs(tab_labels)
+
+    with tabs[0]:
+        st.subheader("공정 입력")
+        render_schedule_editor_tab()
 
     # ==========================
     # 5) 시각화
     # ==========================
-    with tabs[1]:
+    with tabs[2]:
         st.subheader("달력 뷰 (월별 격자)")
 
         mcol1, mcol2, mcol3 = st.columns([1.2, 1, 1])
         with mcol1:
             metric = st.radio(
                 "표시 지표",
-                options=["R_total","R1(H/F/E)","R2(M)"],
+                options=["종합 위험도","인적/설비/환경 위험도","관리적 위험도"],
                 horizontal=True
             )
 
@@ -2346,9 +4263,9 @@ if sch_file is not None and wea_file is not None:
 
                         drow = view_daily[view_daily["date"] == d]
                         if not drow.empty:
-                            rtot = float(drow["R_total"].iloc[0])
-                            r1   = float(drow["R1(H/F/E)"].iloc[0])
-                            r2   = float(drow["R2(M)"].iloc[0])
+                            rtot = float(drow["종합 위험도"].iloc[0])
+                            r1   = float(drow["인적/설비/환경 위험도"].iloc[0])
+                            r2   = float(drow["관리적 위험도"].iloc[0])
                             rc   = float(drow["RC(AMI)"].iloc[0])
                             ide  = float(drow["I(delay)"].iloc[0])
                             rain = float(drow["rain_mm"].iloc[0])
@@ -2357,8 +4274,8 @@ if sch_file is not None and wea_file is not None:
                             hover_row.append(
                                 f"{d:%Y-%m-%d}<br>"
                                 f"위험 레벨: {lvl}<br>"
-                                f"R_total: {rtot:.3f}<br>"
-                                f"R1(H/F/E): {r1:.3f} · R2(M): {r2:.3f}<br>"
+                                f"종합 위험도: {rtot:.3f}<br>"
+                                f"인적/설비/환경 위험도: {r1:.3f} · 관리적 위험도: {r2:.3f}<br>"
                                 f"RC(AMI): {rc:.3f} · I(delay): {ide:.3f}<br>"
                                 f"강수량: {rain:.1f} mm · 풍속: {wind:.1f} m/s"
                             )
@@ -2479,7 +4396,7 @@ if sch_file is not None and wea_file is not None:
 
         line_df = dataframe.melt(
             id_vars=["date"],
-            value_vars=["R_total", "R1(H/F/E)", "R2(M)"],
+            value_vars=["종합 위험도", "인적/설비/환경 위험도", "관리적 위험도"],
             var_name="metric",
             value_name="value",
         )
@@ -2487,11 +4404,11 @@ if sch_file is not None and wea_file is not None:
         thresh_r1 = get_threshold_r1()
         thresh_r2 = get_threshold_r2()
 
-        color_map = {"R_total": "#B10000", "R1(H/F/E)": "#F5A623", "R2(M)": "#1F6FEB"}
-        dash_map = {"R_total": "solid", "R1(H/F/E)": "dot", "R2(M)": "dash"}
+        color_map = {"종합 위험도": "#B10000", "인적/설비/환경 위험도": "#F5A623", "관리적 위험도": "#1F6FEB"}
+        dash_map = {"종합 위험도": "solid", "인적/설비/환경 위험도": "dot", "관리적 위험도": "dash"}
 
         fig_line = go.Figure()
-        for metric in ["R_total", "R1(H/F/E)", "R2(M)"]:
+        for metric in ["종합 위험도", "인적/설비/환경 위험도", "관리적 위험도"]:
             df_m = line_df[line_df["metric"] == metric]
             hover_prefix = "<b>%{x}</b>" if is_monthly else "<b>%{x|%Y-%m-%d}</b>"
             fig_line.add_trace(
@@ -2511,18 +4428,18 @@ if sch_file is not None and wea_file is not None:
                 )
             )
 
-        exceed_r1 = dataframe[dataframe["R1(H/F/E)"] >= thresh_r1]
+        exceed_r1 = dataframe[dataframe["인적/설비/환경 위험도"] >= thresh_r1]
         if not exceed_r1.empty:
             fig_line.add_trace(
                 go.Scatter(
                     x=exceed_r1["date"],
-                    y=exceed_r1["R1(H/F/E)"],
+                    y=exceed_r1["인적/설비/환경 위험도"],
                     mode="markers",
                     name="R1 임계 초과",
                     marker=dict(
                         size=10,
                         symbol="diamond",
-                        color=color_map["R1(H/F/E)"],
+                        color=color_map["인적/설비/환경 위험도"],
                         line=dict(width=1, color="#000000"),
                     ),
                     hovertemplate=hover_prefix + "<br>R1 %{y:.3f}<extra>R1 임계 초과</extra>",
@@ -2530,19 +4447,19 @@ if sch_file is not None and wea_file is not None:
                 )
             )
 
-        exceed_r2 = dataframe[dataframe["R2(M)"] >= thresh_r2]
+        exceed_r2 = dataframe[dataframe["관리적 위험도"] >= thresh_r2]
         if not exceed_r2.empty:
             fig_line.add_trace(
                 go.Scatter(
                     x=exceed_r2["date"],
-                    y=exceed_r2["R2(M)"],
+                    y=exceed_r2["관리적 위험도"],
                     mode="markers",
                     name="R2 임계 초과",
                     marker=dict(
                         size=10,
                         symbol="diamond-open",
-                        color=color_map["R2(M)"],
-                        line=dict(width=2, color=color_map["R2(M)"]),
+                        color=color_map["관리적 위험도"],
+                        line=dict(width=2, color=color_map["관리적 위험도"]),
                     ),
                     hovertemplate=hover_prefix + "<br>R2 %{y:.3f}<extra>R2 임계 초과</extra>",
                     showlegend=True,
@@ -2583,7 +4500,7 @@ if sch_file is not None and wea_file is not None:
 
         st.plotly_chart(fig_line, use_container_width=True)
 
-    with tabs[2]:
+    with tabs[3]:
         st.subheader("추세 분석")
         trend_tabs = st.tabs(["일별", "주간 평균", "월간 평균"])
 
@@ -2604,9 +4521,9 @@ if sch_file is not None and wea_file is not None:
                 editor_cols = [
                     "번호", "점검완료", "감소조치(대분류)", "감소조치(세부항목)", "점검일시", "초과지표",
                     "기준 위험레벨", "현재 위험레벨",
-                    "기준 R_total", "현재 R_total",
-                    "기준 R1(H/F/E)", "현재 R1(H/F/E)",
-                    "기준 R2(M)", "현재 R2(M)",
+                    "기준 종합 위험도", "현재 종합 위험도",
+                    "기준 인적/설비/환경 위험도", "현재 인적/설비/환경 위험도",
+                    "기준 관리적 위험도", "현재 관리적 위험도",
                 ]
 
                 if remaining_alert_count == 0:
@@ -2732,8 +4649,8 @@ if sch_file is not None and wea_file is not None:
                         risk_level_now = row["현재 위험레벨"]
                         tooltip_text = (
                             f"초과지표: {row['초과지표']} · "
-                            f"R1 {row['기준 R1(H/F/E)']:.3f} → {row['현재 R1(H/F/E)']:.3f} · "
-                            f"R2 {row['기준 R2(M)']:.3f} → {row['현재 R2(M)']:.3f}"
+                            f"R1 {row['기준 인적/설비/환경 위험도']:.3f} → {row['현재 인적/설비/환경 위험도']:.3f} · "
+                            f"R2 {row['기준 관리적 위험도']:.3f} → {row['현재 관리적 위험도']:.3f}"
                         )
                         tooltip_html = html.escape(tooltip_text, quote=True)
                         if "Level I" in risk_level_base:
@@ -2997,7 +4914,7 @@ if sch_file is not None and wea_file is not None:
             else:
                 st.caption("등록된 월간 점검 사항이 없습니다.")
 
-    with tabs[3]:
+    with tabs[4]:
         st.subheader("공정 Gantt + 위험 오버레이")
 
         if sch.empty:
@@ -3066,104 +4983,7 @@ if sch_file is not None and wea_file is not None:
             )
             st.plotly_chart(fig_gantt, use_container_width=True)
 
-    with tabs[4]:
-        st.subheader("Top 위험요인/조합 바차트")
-
-        # --- ⑤-1) 코드별 누적 가중치 막대 (TOP N, 가로 막대) ---
-        # 코드별 누적 가중치(ΣRi0 = weight × count)
-        code_counts = {}
-        for codes in sch["hazard_codes"]:
-            for c in codes:
-                code_counts[c] = code_counts.get(c, 0) + 1
-
-        code_rows = []
-        for c, n in code_counts.items():
-            w = CRITIC_WEIGHTS.get(c, 0.0)
-            score = w * n
-            code_rows.append({
-                "code": str(c),                    # 축을 범주형으로 쓰기 위해 문자열 처리
-                "name": HAZARD_NAMES.get(c, str(c)),
-                "category": CODE_CAT.get(c, ""),   # H / F / E / M
-                "count": n,
-                "weight": w,
-                "score": score
-            })
-
-        code_df = pd.DataFrame(code_rows).sort_values("score", ascending=False)
-
-        # 상위 N개만 보기 (필요하면 N 숫자만 바꿔도 됨)
-        TOP_N = 5
-        top_df = code_df.head(TOP_N).copy()
-        top_df["label"] = top_df.apply(
-            lambda row: f"{row['name']} ({row['category']})" if row["name"] != row["code"] else f"{row['code']} ({row['category']})",
-            axis=1
-        )
-
-        # --- ⑤-2) 막대 + 도넛을 나란히 배치 ---
-        col1, col2 = st.columns([2, 1])
-
-        with col1:
-            fig_bar = px.bar(
-                top_df,
-                x="score",
-                y="label",
-                orientation="h",      # 가로 막대
-                color="category",
-                color_discrete_map=HAZARD_CATEGORY_COLORS,
-                text="score",
-                title=f"Top {TOP_N} 위험요인 (ΣRi0 기준)"
-            )
-            fig_bar.update_traces(
-                texttemplate="%{text:.3f}",
-                textposition="outside"
-            )
-            fig_bar.update_layout(
-                xaxis_title="누적 기준위험도 (가중치 × 빈도)",
-                yaxis_title="위험요인 이름 (카테고리)",
-                yaxis=dict(categoryorder="total ascending"),  # 큰 값이 위로 오도록
-                height=400,
-                margin=dict(l=10, r=10, t=40, b=10),
-            )
-            st.plotly_chart(fig_bar, use_container_width=True)
-
-        with col2:
-            # 일자별 위험 레벨 분포 도넛
-            level_counts_raw = daily_df["level"].value_counts()
-            level_order = ["Level I (Red)", "Level II (Yellow)", "Level III (Blue)"]
-            total_days = int(level_counts_raw.sum())
-
-            fig_levels = go.Figure()
-            for lvl in level_order:
-                days = int(level_counts_raw.get(lvl, 0))
-                pct = (days / total_days * 100) if total_days else 0
-                fig_levels.add_trace(
-                    go.Bar(
-                        x=[days],
-                        y=["표시구간"],
-                        name=f"{lvl}",
-                        orientation="h",
-                        marker=dict(color=level_color_map.get(lvl, "#CCCCCC")),
-                        text=f"{pct:.0f}% ({days}일)" if days else "",
-                        textposition="inside",
-                        hovertemplate=f"{lvl}<br>일수: {days}일<br>비율: {pct:.1f}%<extra></extra>",
-                    )
-                )
-
-            fig_levels.update_layout(
-                title="레벨 분포 (표시구간)",
-                barmode="stack",
-                height=320,
-                margin=dict(l=10, r=10, t=60, b=10),
-                legend=dict(title="위험 레벨"),
-                xaxis=dict(title="일수", showgrid=False, zeroline=False),
-                yaxis=dict(title=None, showticklabels=False),
-                plot_bgcolor="rgba(0,0,0,0)",
-                paper_bgcolor="rgba(0,0,0,0)",
-            )
-            st.plotly_chart(fig_levels, use_container_width=True)
-
-
-    with tabs[0]:
+    with tabs[1]:
         mapping_tabs = st.tabs([
             "⚖️ 위험요인 코드/가중치",
             "📋 매핑 테이블",
@@ -3251,6 +5071,201 @@ if sch_file is not None and wea_file is not None:
                 )
 
     with tabs[5]:
+        st.subheader("위험요인 · 조합 분석")
+
+        if view_daily_base.empty:
+            st.info("표시 기간 내 계산된 위험 지표가 없습니다.")
+        else:
+            combo_days = view_daily_base[view_daily_base["RC(AMI)"] > 0].copy()
+            total_days_in_view = len(view_daily_base)
+            max_rc_value = float(combo_days["RC(AMI)"].max()) if not combo_days.empty else 0.0
+            mean_rc_value = float(combo_days["RC(AMI)"].mean()) if not combo_days.empty else 0.0
+
+            mcol1, mcol2, mcol3 = st.columns(3)
+            mcol1.metric("RC(AMI) 발생 일수", f"{len(combo_days)}일")
+            mcol1.caption(f"표시 기간 {total_days_in_view}일 중")
+            mcol2.metric("최대 RC(AMI)", f"{max_rc_value:.3f}")
+            mcol3.metric("평균 RC(AMI)", f"{mean_rc_value:.3f}")
+
+            rc_trend_df = view_daily_base.sort_values("date")[["date", "RC(AMI)", "I(delay)"]]
+            fig_combo_trend = go.Figure()
+            fig_combo_trend.add_trace(
+                go.Scatter(
+                    x=rc_trend_df["date"],
+                    y=rc_trend_df["RC(AMI)"],
+                    name="RC(AMI)",
+                    mode="lines+markers",
+                    line=dict(color="#6366F1", width=3),
+                    marker=dict(size=6, opacity=0.85),
+                    hovertemplate="날짜 %{x|%Y-%m-%d}<br>RC(AMI) %{y:.3f}<extra></extra>",
+                )
+            )
+            fig_combo_trend.add_trace(
+                go.Scatter(
+                    x=rc_trend_df["date"],
+                    y=rc_trend_df["I(delay)"],
+                    name="I(delay)",
+                    mode="lines",
+                    line=dict(color="#f97316", width=2, dash="dot"),
+                    hovertemplate="날짜 %{x|%Y-%m-%d}<br>I(delay) %{y:.3f}<extra></extra>",
+                )
+            )
+            fig_combo_trend.update_layout(
+                height=360,
+                margin=dict(l=10, r=10, t=10, b=10),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                yaxis=dict(title="지표 값"),
+                xaxis=dict(title=None),
+                plot_bgcolor="rgba(0,0,0,0)",
+                paper_bgcolor="rgba(0,0,0,0)",
+            )
+            st.plotly_chart(fig_combo_trend, use_container_width=True)
+
+            daily_combo_records = []
+            for day_ts in pd.date_range(vmin, vmax, freq="D"):
+                day_date = day_ts.date()
+                day_tasks = active_tasks_on_date(sch, day_date)
+                if day_tasks.empty:
+                    continue
+                codes_for_day = []
+                for _, task_row in day_tasks.iterrows():
+                    codes = task_row["hazard_codes"]
+                    if isinstance(codes, list):
+                        codes_for_day.extend(codes)
+                drow = view_daily_base[view_daily_base["date"] == day_date]
+                env_flag = False
+                if not drow.empty:
+                    rain_val = float(drow["rain_mm"].iloc[0])
+                    wind_val = float(drow["wind_ms"].iloc[0])
+                    env_flag = (rain_val >= rain_thr) or (wind_val >= wind_thr)
+                cats = categories_present(codes_for_day, env_flag=env_flag)
+                if not cats:
+                    continue
+                combo_key = "+".join(sorted(cats))
+                rc_value = float(drow["RC(AMI)"].iloc[0]) if not drow.empty else 0.0
+                daily_combo_records.append(
+                    {
+                        "date": day_date,
+                        "combo_key": combo_key,
+                        "카테고리 수": len(cats),
+                        "RC(AMI)": rc_value,
+                    }
+                )
+
+            combo_summary_df = pd.DataFrame(daily_combo_records)
+            if combo_summary_df.empty:
+                st.info("선택한 기간에 AMI 조합 위험이 발생하지 않았습니다.")
+            else:
+                combo_summary = (
+                    combo_summary_df.groupby("combo_key", as_index=False)
+                    .agg(
+                        발생일수=("date", "nunique"),
+                        평균_RC=("RC(AMI)", "mean"),
+                        최대_RC=("RC(AMI)", "max"),
+                    )
+                    .sort_values(["발생일수", "최대_RC"], ascending=[False, False])
+                )
+                combo_summary["평균_RC"] = combo_summary["평균_RC"].round(3)
+                combo_summary["최대_RC"] = combo_summary["최대_RC"].round(3)
+
+                ami_reference_df = pd.DataFrame(
+                    [
+                        {"combo_key": "+".join(sorted(combo)), "참고 AMI 가중치": weight}
+                        for combo, weight in AMI_COMBOS.items()
+                    ]
+                )
+                combo_summary = combo_summary.merge(ami_reference_df, on="combo_key", how="left")
+                if "참고 AMI 가중치" in combo_summary:
+                    combo_summary["참고 AMI 가중치"] = combo_summary["참고 AMI 가중치"].round(5)
+
+                st.markdown("###### 조합별 발생 현황")
+                st.dataframe(
+                    combo_summary,
+                    use_container_width=True,
+                    height=min(320, 80 + len(combo_summary) * 28),
+                )
+
+                combo_chart = px.bar(
+                    combo_summary,
+                    x="combo_key",
+                    y="발생일수",
+                    text="발생일수",
+                    hover_data=["평균_RC", "최대_RC", "참고 AMI 가중치"],
+                    labels={"combo_key": "카테고리 조합", "발생일수": "발생 일수"},
+                    title="카테고리 조합별 발생 일수",
+                    color="combo_key",
+                    color_discrete_sequence=px.colors.qualitative.Pastel,
+                )
+                combo_chart.update_traces(texttemplate="%{text}일", textposition="outside")
+                combo_chart.update_layout(
+                    height=360,
+                    margin=dict(l=10, r=10, t=50, b=30),
+                    showlegend=False,
+                )
+                st.plotly_chart(combo_chart, use_container_width=True)
+
+            hazard_records = []
+            active_task_mask = (
+                sch["planned_start"].notna()
+                & sch["planned_end"].notna()
+                & (sch["planned_end"] >= vmin)
+                & (sch["planned_start"] <= vmax)
+            )
+            for _, task_row in sch[active_task_mask].iterrows():
+                codes = task_row["hazard_codes"]
+                if not isinstance(codes, list) or not codes:
+                    continue
+                for code in codes:
+                    hazard_records.append(
+                        {
+                            "위험코드": code,
+                            "위험명": HAZARD_NAMES.get(code, ""),
+                            "카테고리": CODE_CAT.get(code, ""),
+                            "가중치": CRITIC_WEIGHTS.get(code, 0.0),
+                        }
+                    )
+
+            if hazard_records:
+                hazard_df = pd.DataFrame(hazard_records)
+                category_labels = {"H": "H · 인적", "F": "F · 설비", "E": "E · 환경", "M": "M · 관리"}
+                hazard_df["카테고리명"] = hazard_df["카테고리"].map(category_labels).fillna("미정")
+                cat_summary = (
+                    hazard_df.groupby("카테고리명", as_index=False)
+                    .agg(
+                        위험코드수=("위험코드", "count"),
+                        가중치합=("가중치", "sum"),
+                    )
+                    .sort_values("가중치합", ascending=False)
+                )
+                cat_summary["가중치합"] = cat_summary["가중치합"].round(3)
+
+                cat_fig = px.bar(
+                    cat_summary,
+                    x="카테고리명",
+                    y="가중치합",
+                    text="위험코드수",
+                    labels={"가중치합": "가중치 합", "카테고리명": "카테고리"},
+                    title="카테고리별 위험 가중치 합계",
+                    color="카테고리명",
+                    color_discrete_sequence=px.colors.sequential.Blues_r,
+                )
+                cat_fig.update_traces(texttemplate="%{text}건", textposition="outside")
+                cat_fig.update_layout(
+                    height=360,
+                    margin=dict(l=10, r=10, t=50, b=30),
+                    showlegend=False,
+                )
+                st.plotly_chart(cat_fig, use_container_width=True)
+
+                st.dataframe(
+                    cat_summary,
+                    use_container_width=True,
+                    height=min(280, 80 + len(cat_summary) * 26),
+                )
+            else:
+                st.info("선택한 기간에 활성화된 위험 코드가 없습니다.")
+
+    with tabs[6]:
         st.subheader("기상 ↔ 위험도 상관")
 
         if view_daily.empty:
@@ -3287,7 +5302,7 @@ if sch_file is not None and wea_file is not None:
 
                 agg = (
                     temp.groupby(["rain_bin", "wind_bin"], observed=True)
-                    .agg(avg_R=("R_total", "mean"), count=("R_total", "size"), red=("level", lambda x: (x == "Level I (Red)").sum()))
+                    .agg(avg_R=("종합 위험도", "mean"), count=("종합 위험도", "size"), red=("level", lambda x: (x == "Level I (Red)").sum()))
                     .reset_index()
                 )
                 if agg.empty:
@@ -3328,7 +5343,7 @@ if sch_file is not None and wea_file is not None:
                             [0.5, "#F6E58D"],
                             [1.0, "#B10000"],
                         ],
-                        colorbar=dict(title="평균 R_total"),
+                        colorbar=dict(title="평균 종합 위험도"),
                         hoverinfo="text",
                     )
                 )
@@ -3351,10 +5366,10 @@ if sch_file is not None and wea_file is not None:
                 timeline.add_trace(
                     go.Scatter(
                         x=plot_df["date"],
-                        y=plot_df["R_total"],
-                        name="R_total",
+                        y=plot_df["종합 위험도"],
+                        name="종합 위험도",
                         line=dict(color="#B10000", width=3),
-                        hovertemplate="날짜 %{x|%Y-%m-%d}<br>R_total %{y:.3f}<extra></extra>",
+                        hovertemplate="날짜 %{x|%Y-%m-%d}<br>종합 위험도 %{y:.3f}<extra></extra>",
                     ),
                     secondary_y=False,
                 )
@@ -3380,7 +5395,7 @@ if sch_file is not None and wea_file is not None:
                     ),
                     secondary_y=True,
                 )
-                timeline.update_yaxes(title_text="R_total", secondary_y=False)
+                timeline.update_yaxes(title_text="종합 위험도", secondary_y=False)
                 timeline.update_yaxes(title_text="강수·풍속", secondary_y=True)
                 timeline.update_layout(
                     title="일자별 위험도 & 기상 추이",
@@ -3410,7 +5425,7 @@ if sch_file is not None and wea_file is not None:
                 else:
                     st.plotly_chart(timeline_fig, use_container_width=True)
 
-    with tabs[6]:
+    with tabs[7]:
         st.subheader("데이터")
         t1, t2, t3 = st.tabs(["Daily 결과", "Per-task 결과", "점검 기록"])
         with t1:
@@ -3444,7 +5459,7 @@ if sch_file is not None and wea_file is not None:
             else:
                 st.info("아직 기록된 점검 이력이 없습니다.")
 
-    with tabs[7]:
+    with tabs[8]:
         st.subheader("붕괴위험 체크리스트")
         st.caption("현장 상황과 공정 특성에 맞춰 세부 점검 항목을 추가하거나 주기를 조정해 활용하세요.")
 
@@ -3465,4 +5480,33 @@ if sch_file is not None and wea_file is not None:
                     st.markdown("")
 
 else:
-    st.info("좌측에서 공정표 엑셀과 기상 엑셀을 업로드해주세요.")
+    if st.session_state["schedule_committed_df"].empty:
+        status_message = "공정표 엑셀을 업로드하거나 공정을 입력한 뒤 **공정 입력 완료** 버튼을 눌러 저장해주세요."
+    elif sch.empty:
+        status_message = "저장된 공정이 없습니다. 공정을 다시 입력하고 완료 버튼을 눌러주세요."
+    else:
+        status_message = "좌측에서 기상 엑셀을 업로드하면 위험도 분석이 실행됩니다."
+
+    st.info(status_message)
+
+    placeholder_tab_labels = [
+        "🛠️ 공정 입력",
+        "🗂️ 위험요인 매핑",
+        "📅 달력 뷰",
+        "📈 추세",
+        "🧱 공정 Gantt",
+        "📊 위험요인/조합",
+        "🌦️ 기상-위험 상관",
+        "🔎 데이터",
+        "✅ 체크리스트",
+    ]
+    st.write("---")
+    st.caption("공정과 기상 데이터를 모두 준비하면 아래 탭에 시각화와 테이블이 표시됩니다.")
+    placeholder_tabs = st.tabs(placeholder_tab_labels)
+    with placeholder_tabs[0]:
+        st.subheader("공정 입력")
+        render_schedule_editor_tab()
+        st.info("공정을 저장하면 다른 탭의 분석이 활성화됩니다.")
+    for idx in range(1, len(placeholder_tab_labels)):
+        with placeholder_tabs[idx]:
+            st.info("공정·기상 데이터가 준비되면 이 탭에서 결과가 표시됩니다.")
